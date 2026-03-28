@@ -1,0 +1,991 @@
+"""
+RF Pulse Bloch Equation Simulator
+==================================
+Hand-draw RF pulse shapes and see real-time slice profiles.
+
+Parameters
+----------
+  - RF duration (ms)  – typed manually
+  - Slice thickness (mm)
+  - TBW (time-bandwidth product)
+  - B1 max (µT)
+  - Gradient max (mT/m)
+
+Requirements:
+    pip install numpy scipy matplotlib PyQt5
+
+Run:
+    python rf_bloch_simulator.py
+"""
+
+import sys
+import numpy as np
+from scipy.signal import windows
+import matplotlib
+matplotlib.use("Qt5Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QSlider, QLabel, QGroupBox, QComboBox,
+    QRadioButton, QStatusBar, QLineEdit,
+)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QPalette, QColor, QDoubleValidator, QCursor
+
+
+# ── physical constants ─────────────────────────────────────────────────────────
+GAMMA_HZ_PER_T = 42.577e6   # Hz/T  (proton gyromagnetic ratio)
+GAMMA_RAD      = 2 * np.pi * GAMMA_HZ_PER_T
+
+
+# ── Bloch solver (vectorised, no relaxation) ───────────────────────────────────
+
+# ── Bloch solver ───────────────────────────────────────────────────────────────
+# We use Numba for the Bloch simulation — it is the only real hotspot.
+# The time-step loop (N=512) cannot be vectorised because each step depends on
+# the previous Mx/My/Mz state.  Numba JIT-compiles it to native code and runs
+# the S=300 slice positions in parallel via prange.
+#
+# First import attempt: if Numba is not installed we fall back to a pure-numpy
+# vectorised version that is still reasonably fast.
+
+try:
+    import numba
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True, fastmath=True)
+    def bloch_simulate(rf_amp_rad, rf_phase_rad, offsets_hz, dt_s):
+        """
+        Hard-pulse Bloch simulation — Numba parallel JIT version.
+        Outer loop (slice positions) runs in parallel; inner loop (RF steps)
+        is sequential because each step depends on the previous M state.
+        """
+        N = rf_amp_rad.shape[0]
+        S = offsets_hz.shape[0]
+
+        Mx_out  = np.empty(S)
+        My_out  = np.empty(S)
+        Mz_out  = np.empty(S)
+
+        for s in prange(S):                      # parallel over slice positions
+            dw = 2.0 * np.pi * offsets_hz[s] * dt_s
+
+            mx = 0.0; my = 0.0; mz = 1.0        # initial equilibrium
+
+            for i in range(N):                   # sequential over RF time steps
+                a   = rf_amp_rad[i]
+                phi = rf_phase_rad[i]
+
+                wx = a * np.cos(phi)
+                wy = a * np.sin(phi)
+                wz = dw
+
+                w2 = wx*wx + wy*wy + wz*wz
+                w  = np.sqrt(w2) + 1e-30
+                nx = wx / w;  ny = wy / w;  nz = wz / w
+
+                c  = np.cos(w)
+                s_ = np.sin(w)
+                oc = 1.0 - c
+
+                nmx = mx*(c + nx*nx*oc) + my*(nx*ny*oc - nz*s_) + mz*(nx*nz*oc + ny*s_)
+                nmy = mx*(ny*nx*oc + nz*s_) + my*(c + ny*ny*oc) + mz*(ny*nz*oc - nx*s_)
+                nmz = mx*(nz*nx*oc - ny*s_) + my*(nz*ny*oc + nx*s_) + mz*(c + nz*nz*oc)
+
+                mx = nmx;  my = nmy;  mz = nmz
+
+            Mx_out[s] = mx
+            My_out[s] = my
+            Mz_out[s] = mz
+
+        return Mx_out + 1j * My_out, Mz_out
+
+    _NUMBA_AVAILABLE = True
+
+except ImportError:
+    _NUMBA_AVAILABLE = False
+
+    def bloch_simulate(rf_amp_rad, rf_phase_rad, offsets_hz, dt_s):
+        """
+        Hard-pulse Bloch simulation — pure-numpy vectorised fallback.
+        All S slice positions are computed simultaneously per RF step.
+        Install numba for ~10-20x speedup.
+        """
+        N = len(rf_amp_rad)
+        S = len(offsets_hz)
+
+        dw = 2.0 * np.pi * offsets_hz * dt_s    # (S,) off-res rotation per step
+
+        Mx = np.zeros(S)
+        My = np.zeros(S)
+        Mz = np.ones(S)
+
+        for i in range(N):
+            a   = rf_amp_rad[i]
+            phi = rf_phase_rad[i]
+
+            wx = a * np.cos(phi)
+            wy = a * np.sin(phi)
+            wz = dw
+
+            w  = np.sqrt(wx**2 + wy**2 + wz**2) + 1e-30
+            nx = wx / w;  ny = wy / w;  nz = wz / w
+
+            c  = np.cos(w);  s_ = np.sin(w);  oc = 1.0 - c
+
+            nMx = Mx*(c + nx*nx*oc)      + My*(nx*ny*oc - nz*s_) + Mz*(nx*nz*oc + ny*s_)
+            nMy = Mx*(ny*nx*oc + nz*s_)  + My*(c + ny*ny*oc)     + Mz*(ny*nz*oc - nx*s_)
+            nMz = Mx*(nz*nx*oc - ny*s_)  + My*(nz*ny*oc + nx*s_) + Mz*(c + nz*nz*oc)
+
+            Mx, My, Mz = nMx, nMy, nMz
+
+        return Mx + 1j * My, Mz
+
+
+# ── preset pulses ──────────────────────────────────────────────────────────────
+# All presets receive (n, flip_deg, tbw) and return (amp, phase).
+# Amplitude can be negative — negative lobes are real and go below zero.
+# _norm scales so ∑amp = flip_deg in rad (correct hard-pulse area).
+
+def _norm(env, flip_deg):
+    """Normalise so the signed area equals the requested flip angle in rad."""
+    s = env.sum()
+    if abs(s) < 1e-12:
+        # fall back to peak normalisation if signed sum is near zero
+        pk = np.abs(env).max()
+        return env / pk * np.deg2rad(flip_deg) if pk > 1e-12 else env
+    return env / s * np.deg2rad(flip_deg)
+
+def preset_sinc_hann(n, flip_deg, tbw):
+    """Sinc × Hann — standard workhorse, negative sidelobes intact."""
+    t   = np.linspace(-tbw / 2, tbw / 2, n)
+    env = np.sinc(t) * windows.hann(n)
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_sinc_hamming(n, flip_deg, tbw):
+    """Sinc × Hamming — slightly wider transition band, negative lobes intact."""
+    t   = np.linspace(-tbw / 2, tbw / 2, n)
+    env = np.sinc(t) * windows.hamming(n)
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_sinc_infinite(n, flip_deg, tbw):
+    """
+    Unwindowed sinc — maximum lobes for given TBW, no tapering.
+    Negative lobes appear as real negative amplitude values.
+    """
+    t   = np.linspace(-tbw / 2, tbw / 2, n)
+    env = np.sinc(t)
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_sinc_gauss(n, flip_deg, tbw):
+    """
+    Sinc × Gaussian — better sidelobe suppression than Hann while
+    preserving more lobes.  Negative sidelobes intact.
+    Gaussian sigma = tbw/4 so width scales with TBW.
+    """
+    t     = np.linspace(-tbw / 2, tbw / 2, n)
+    sigma = tbw / 4.0
+    gauss = np.exp(-t**2 / (2 * sigma**2))
+    env   = np.sinc(t) * gauss
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_sinc_gauss_causal(n, flip_deg, tbw):
+    """
+    Asymmetric (minimum-phase / causal) sinc-Gauss:
+    The main lobe sits at the RIGHT end of the pulse.
+    The leading sidelobes (negative) ramp up from the left.
+    Achieved by mirroring the time axis of a standard sinc-gauss
+    so t=0 is at the far right (index n-1).
+    """
+    t     = np.linspace(-tbw, 0, n)          # t runs from -tbw → 0 (peak at right)
+    sigma = tbw / 4.0
+    gauss = np.exp(-t**2 / (2 * sigma**2))
+    env   = np.sinc(t) * gauss               # sinc(0)=1 at right end
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_gauss(n, flip_deg, tbw):
+    """Pure Gaussian — no lobes, smooth, poor slice selectivity."""
+    t   = np.linspace(-0.5, 0.5, n)
+    sig = 0.5 / max(tbw, 1)
+    env = np.exp(-t**2 / (2 * sig**2))
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_rect(n, flip_deg, tbw):
+    """Rectangular (hard pulse) — worst slice profile, easiest to implement."""
+    env = np.zeros(n)
+    env[n//4 : 3*n//4] = 1.0
+    return _norm(env, flip_deg), np.zeros(n)
+
+def preset_chirp(n, flip_deg, tbw):
+    """Linear-phase chirp (adiabatic-like sweep) — TBW sets sweep bandwidth."""
+    t     = np.linspace(0, 1, n)
+    phase = np.pi * tbw * (t - 0.5)**2
+    env   = windows.hann(n)
+    return _norm(env, flip_deg), phase
+
+PRESETS = {
+    "Sinc + Hann":           preset_sinc_hann,
+    "Sinc + Hamming":        preset_sinc_hamming,
+    "Sinc infinite (no win)":preset_sinc_infinite,
+    "Sinc × Gauss":          preset_sinc_gauss,
+    "Sinc × Gauss (causal)": preset_sinc_gauss_causal,
+    "Gaussian":              preset_gauss,
+    "Rectangular":           preset_rect,
+    "Chirp":                 preset_chirp,
+}
+
+
+# ── Numba warm-up ──────────────────────────────────────────────────────────────
+# Trigger JIT compilation before the UI starts so the first interaction is fast.
+def _warmup_bloch():
+    if not _NUMBA_AVAILABLE:
+        return
+    _dummy_amp   = np.zeros(8,  dtype=np.float64)
+    _dummy_phase = np.zeros(8,  dtype=np.float64)
+    _dummy_off   = np.zeros(16, dtype=np.float64)
+    bloch_simulate(_dummy_amp, _dummy_phase, _dummy_off, 1e-6)
+
+
+class RFSimulator(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RF Pulse Bloch Simulator")
+        self.setMinimumSize(1200, 760)
+
+        # internal state
+        self.N          = 512
+        self.n_slices   = 300
+        self.CANVAS_MULT    = 4
+        self.canvas_dur_ms  = 4.0 * self.CANVAS_MULT   # updated with rf_dur_ms
+        # arrays are canvas-sized (CANVAS_MULT × N)
+        self.rf_amp   = np.zeros(self.N * self.CANVAS_MULT)
+        self.rf_phase = np.zeros(self.N * self.CANVAS_MULT)
+        self._drawing   = False
+        self._draw_mode = "amp"   # "amp" | "phase" | "slide"
+        self._last_ix   = -1
+
+        # waveform-slide state (the window is fixed at 0→rf_dur_ms;
+        # in slide mode we shift the waveform data along the canvas)
+        self._slide_active  = False
+        self._slide_drag_x0 = 0.0          # canvas x (ms) at drag start
+        self._slide_amp_snap   = None      # snapshot of rf_amp at drag start
+        self._slide_phase_snap = None
+
+        # zoom state — one entry per axis, stores (xl, xr, yl, yu) at drag start
+        # and pixel position at drag start
+        self._zoom_active  = False
+        self._zoom_ax      = None
+        self._zoom_start_px   = (0, 0)   # (x_px, y_px) when right-button pressed
+        self._zoom_start_lim  = None     # (xl, xr, yl, yu) at that moment
+
+        # physical params (defaults)
+        self.rf_dur_ms  = 4.0
+        self.flip_deg   = 90.0
+        self.tbw        = 4.0
+        self.b1max_ut   = 15.0
+        self.slice_mm   = 5.0
+        self.canvas_dur_ms = self.rf_dur_ms * self.CANVAS_MULT
+
+        self._build_ui()
+        self._connect_signals()
+        self._apply_preset("Sinc + Hann")
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setSpacing(4)
+        root.setContentsMargins(6, 6, 6, 4)
+
+        root.addLayout(self._build_toolbar())
+
+        self.fig = plt.Figure(figsize=(14, 8))
+        self._build_axes()
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setMinimumHeight(480)
+        # suppress the default right-click context menu so right-drag zoom works cleanly
+        self.canvas.setContextMenuPolicy(Qt.PreventContextMenu)
+        root.addWidget(self.canvas)
+
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        self.status.showMessage(
+            "Left-drag = draw  |  '↔ Shift pulse' mode: left-drag shifts the whole waveform along time axis  |  "
+            "Right-drag = zoom  |  Right dbl-click = reset zoom  |  Scroll = x-zoom"
+        )
+
+        self.canvas.mpl_connect("button_press_event",   self._on_press)
+        self.canvas.mpl_connect("motion_notify_event",  self._on_move)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+        self.canvas.mpl_connect("scroll_event",         self._on_scroll)
+
+        self._sim_timer = QTimer()
+        self._sim_timer.setSingleShot(True)
+        self._sim_timer.timeout.connect(self._run_sim)
+
+    def _lbl(self, text):
+        l = QLabel(text)
+        l.setStyleSheet("color:#8b949e; font-size:11px;")
+        return l
+
+    def _build_toolbar(self):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        # preset
+        g = QGroupBox("Preset")
+        gl = QHBoxLayout(g); gl.setContentsMargins(6, 2, 6, 4)
+        self.cb_preset = QComboBox()
+        self.cb_preset.addItems(list(PRESETS.keys()))
+        self.cb_preset.setMinimumWidth(175)
+        gl.addWidget(self.cb_preset)
+        row.addWidget(g)
+
+        # draw mode  (Amplitude | Phase | Shift pulse)
+        g2 = QGroupBox("Draw mode")
+        g2l = QHBoxLayout(g2); g2l.setContentsMargins(6, 2, 6, 4)
+        self.rb_amp   = QRadioButton("Amplitude")
+        self.rb_phase = QRadioButton("Phase")
+        self.rb_slide = QRadioButton("↔ Shift pulse")
+        self.rb_slide.setStyleSheet("color:#ffa657;")
+        self.rb_amp.setChecked(True)
+        g2l.addWidget(self.rb_amp)
+        g2l.addWidget(self.rb_phase)
+        g2l.addWidget(self.rb_slide)
+        row.addWidget(g2)
+
+        # RF duration — typed manually
+        g3 = QGroupBox("RF duration")
+        g3l = QHBoxLayout(g3); g3l.setContentsMargins(6, 2, 6, 4); g3l.setSpacing(4)
+        self.edit_dur = QLineEdit("4.00")
+        self.edit_dur.setFixedWidth(56)
+        self.edit_dur.setValidator(QDoubleValidator(0.1, 200.0, 2))
+        self.edit_dur.setAlignment(Qt.AlignRight)
+        self.edit_dur.setStyleSheet(
+            "background:#0d1117; color:#c9d1d9; border:1px solid #30363d;"
+            "border-radius:4px; padding:1px 4px; font-size:12px;"
+        )
+        g3l.addWidget(self.edit_dur); g3l.addWidget(self._lbl("ms"))
+        row.addWidget(g3)
+
+        # flip angle
+        g4 = QGroupBox("Flip angle")
+        g4l = QHBoxLayout(g4); g4l.setContentsMargins(6, 2, 6, 4); g4l.setSpacing(4)
+        self.sl_flip = QSlider(Qt.Horizontal)
+        self.sl_flip.setRange(1, 360); self.sl_flip.setValue(90)
+        self.sl_flip.setFixedWidth(90)
+        self.lbl_flip = QLabel("90°"); self.lbl_flip.setMinimumWidth(34)
+        g4l.addWidget(self.sl_flip); g4l.addWidget(self.lbl_flip)
+        row.addWidget(g4)
+
+        # TBW
+        g5 = QGroupBox("TBW")
+        g5l = QHBoxLayout(g5); g5l.setContentsMargins(6, 2, 6, 4); g5l.setSpacing(4)
+        self.sl_tbw = QSlider(Qt.Horizontal)
+        self.sl_tbw.setRange(1, 16); self.sl_tbw.setValue(4)
+        self.sl_tbw.setFixedWidth(80)
+        self.lbl_tbw = QLabel("4"); self.lbl_tbw.setMinimumWidth(18)
+        g5l.addWidget(self.sl_tbw); g5l.addWidget(self.lbl_tbw)
+        row.addWidget(g5)
+
+        # Slice thickness
+        g6 = QGroupBox("Slice thickness")
+        g6l = QHBoxLayout(g6); g6l.setContentsMargins(6, 2, 6, 4); g6l.setSpacing(4)
+        self.sl_slice = QSlider(Qt.Horizontal)
+        self.sl_slice.setRange(1, 50); self.sl_slice.setValue(5)
+        self.sl_slice.setFixedWidth(80)
+        self.lbl_slice = QLabel("5 mm"); self.lbl_slice.setMinimumWidth(36)
+        g6l.addWidget(self.sl_slice); g6l.addWidget(self.lbl_slice)
+        row.addWidget(g6)
+
+        # B1 max — typed, fixed value like duration
+        g7 = QGroupBox("B1 max")
+        g7l = QHBoxLayout(g7); g7l.setContentsMargins(6, 2, 6, 4); g7l.setSpacing(4)
+        self.edit_b1 = QLineEdit("15.0")
+        self.edit_b1.setFixedWidth(52)
+        self.edit_b1.setValidator(QDoubleValidator(0.1, 500.0, 1))
+        self.edit_b1.setAlignment(Qt.AlignRight)
+        self.edit_b1.setStyleSheet(
+            "background:#0d1117; color:#c9d1d9; border:1px solid #30363d;"
+            "border-radius:4px; padding:1px 4px; font-size:12px;"
+        )
+        g7l.addWidget(self.edit_b1); g7l.addWidget(self._lbl("µT"))
+        row.addWidget(g7)
+
+        # Gradient max — computed from TBW / (γ · T_RF · Δz), read-only display
+        g8 = QGroupBox("G_slice (computed)")
+        g8l = QHBoxLayout(g8); g8l.setContentsMargins(6, 2, 6, 4); g8l.setSpacing(4)
+        self.lbl_grad_computed = QLabel("—")
+        self.lbl_grad_computed.setStyleSheet(
+            "color:#ffa657; font-size:12px; font-weight:500;"
+        )
+        self.lbl_grad_computed.setMinimumWidth(70)
+        g8l.addWidget(self.lbl_grad_computed); g8l.addWidget(self._lbl("mT/m"))
+        row.addWidget(g8)
+
+        # Clear
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.setFixedWidth(52)
+        row.addWidget(self.btn_clear)
+
+        row.addStretch()
+        return row
+
+    def _build_axes(self):
+        gs = gridspec.GridSpec(
+            2, 3, figure=self.fig,
+            hspace=0.50, wspace=0.35,
+            left=0.06, right=0.98, top=0.95, bottom=0.08
+        )
+        self.ax_rf  = self.fig.add_subplot(gs[0, :])
+        self.ax_mxy = self.fig.add_subplot(gs[1, 0])
+        self.ax_mz  = self.fig.add_subplot(gs[1, 1])
+        self.ax_ph  = self.fig.add_subplot(gs[1, 2])
+
+        BG  = "#0d1117"
+        FIG = "#161b22"
+        TC  = "#8b949e"
+        SP  = "#30363d"
+        self.fig.patch.set_facecolor(FIG)
+
+        for ax in (self.ax_rf, self.ax_mxy, self.ax_mz, self.ax_ph):
+            ax.set_facecolor(BG)
+            ax.tick_params(labelsize=8, colors=TC)
+            for sp in ax.spines.values():
+                sp.set_color(SP)
+
+        for ax, title in [
+            (self.ax_rf,  "RF pulse  —  left-drag: draw   right-drag: zoom   dbl-right-click: reset zoom"),
+            (self.ax_mxy, "|Mxy|  (transverse magnetisation)"),
+            (self.ax_mz,  "Mz  (longitudinal magnetisation)"),
+            (self.ax_ph,  "Phase(Mxy)  across slice"),
+        ]:
+            ax.set_title(title, fontsize=9, color="#c9d1d9", pad=5)
+
+        t_ms = np.linspace(0, self.canvas_dur_ms, self.N * self.CANVAS_MULT)
+        x_mm = np.linspace(-self.slice_mm * 3, self.slice_mm * 3, self.n_slices)
+
+        # RF — x-axis spans the full canvas (4× rf_dur_ms)
+        self.line_amp, = self.ax_rf.plot(t_ms, np.zeros(len(t_ms)), color="#58a6ff", lw=1.8, label="B1 (µT)")
+        self.line_phs, = self.ax_rf.plot(t_ms, np.zeros(len(t_ms)), color="#ff7b72", lw=1.2, ls="--", alpha=0.85, label="phase (rad)")
+        self.ax_rf.axhline(0, color=SP, lw=0.5)
+        self.ax_rf.set_xlim(0, self.canvas_dur_ms)
+        self.ax_rf.set_xlabel("time (ms)  [full drawing canvas]", fontsize=8, color=TC)
+        self.ax_rf.set_ylabel("B1 (µT)  /  phase (rad)", fontsize=8, color=TC)
+        self.ax_rf.legend(loc="upper right", fontsize=8, facecolor=FIG, edgecolor=SP, labelcolor="#c9d1d9")
+
+        # Active window highlight — always fixed at 0 → rf_dur_ms
+        self._win_span = self.ax_rf.axvspan(
+            0, self.rf_dur_ms,
+            alpha=0.12, color="#ffa657", zorder=0
+        )
+        self._win_left  = self.ax_rf.axvline(0,               color="#ffa657", lw=1.2, ls="--", zorder=3)
+        self._win_right = self.ax_rf.axvline(self.rf_dur_ms,  color="#ffa657", lw=1.2, ls="--", zorder=3)
+        self._win_label = self.ax_rf.text(
+            self.rf_dur_ms * 0.02, 0.97,
+            f"active: 0 – {self.rf_dur_ms:.2f} ms",
+            transform=self.ax_rf.get_xaxis_transform(),
+            fontsize=7, color="#ffa657", va="top"
+        )
+
+        # |Mxy|
+        self.line_mxy, = self.ax_mxy.plot(x_mm, np.zeros(self.n_slices), color="#58a6ff", lw=1.8)
+        self.ax_mxy.set_xlim(x_mm[0], x_mm[-1])
+        self.ax_mxy.set_ylim(-0.02, 1.05)
+        self.ax_mxy.set_xlabel("position (mm)", fontsize=8, color=TC)
+        self.ax_mxy.set_ylabel("|Mxy|", fontsize=8, color=TC)
+        self.ax_mxy.axhline(0, color=SP, lw=0.5)
+        self.ax_mxy.axhline(0.5, color="#444c56", lw=0.5, ls=":")
+
+        # Mz
+        self.line_mz, = self.ax_mz.plot(x_mm, np.ones(self.n_slices), color="#3fb950", lw=1.8)
+        self.ax_mz.set_xlim(x_mm[0], x_mm[-1])
+        self.ax_mz.set_ylim(-1.05, 1.05)
+        self.ax_mz.set_xlabel("position (mm)", fontsize=8, color=TC)
+        self.ax_mz.set_ylabel("Mz", fontsize=8, color=TC)
+        self.ax_mz.axhline(0, color=SP, lw=0.5)
+
+        # Phase
+        self.line_phase, = self.ax_ph.plot(x_mm, np.zeros(self.n_slices), color="#f78166", lw=1.8)
+        self.ax_ph.set_xlim(x_mm[0], x_mm[-1])
+        self.ax_ph.set_ylim(-np.pi - 0.2, np.pi + 0.2)
+        self.ax_ph.set_yticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
+        self.ax_ph.set_yticklabels(["-π", "-π/2", "0", "π/2", "π"], fontsize=8, color=TC)
+        self.ax_ph.set_xlabel("position (mm)", fontsize=8, color=TC)
+        self.ax_ph.set_ylabel("phase (rad)", fontsize=8, color=TC)
+        self.ax_ph.axhline(0, color=SP, lw=0.5)
+
+        # FWHM markers
+        self._fwhm_lines = [
+            self.ax_mxy.axvline(0, color="#ffa657", lw=0.8, ls="--", visible=False),
+            self.ax_mxy.axvline(0, color="#ffa657", lw=0.8, ls="--", visible=False),
+        ]
+
+    # ── signal wiring ──────────────────────────────────────────────────────────
+
+    def _connect_signals(self):
+        self.cb_preset.currentTextChanged.connect(
+            lambda _: self._apply_preset(self.cb_preset.currentText())
+        )
+        self.btn_clear.clicked.connect(self._on_clear)
+
+        from PyQt5.QtWidgets import QButtonGroup
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.rb_amp,   0)
+        self._mode_group.addButton(self.rb_phase, 1)
+        self._mode_group.addButton(self.rb_slide, 2)
+        self._mode_group.idClicked.connect(self._on_mode_changed)
+        self.edit_dur.editingFinished.connect(self._on_duration_changed)
+        self.edit_b1.editingFinished.connect(self._on_b1_changed)
+
+        def _sl(sl, lbl, suffix, attr):
+            def _f(v):
+                lbl.setText(f"{v}{suffix}")
+                setattr(self, attr, float(v))
+                # re-apply preset so shape scales with new TBW/flip
+                self._apply_preset(self.cb_preset.currentText())
+            sl.valueChanged.connect(_f)
+
+        _sl(self.sl_flip,  self.lbl_flip,  "°",   "flip_deg")
+        _sl(self.sl_tbw,   self.lbl_tbw,   "",    "tbw")
+
+        def _sl_sim(sl, lbl, suffix, attr):
+            def _f(v):
+                lbl.setText(f"{v}{suffix}")
+                setattr(self, attr, float(v))
+                self._schedule_sim()
+            sl.valueChanged.connect(_f)
+
+        _sl_sim(self.sl_slice, self.lbl_slice, " mm", "slice_mm")
+
+    def _on_mode_changed(self, btn_id):
+        modes  = {0: 'amp', 1: 'phase', 2: 'slide'}
+        self._draw_mode = modes.get(btn_id, 'amp')
+        if self._draw_mode == 'slide':
+            self.canvas.setCursor(Qt.SizeHorCursor)
+        else:
+            self.canvas.setCursor(Qt.CrossCursor)
+
+    def _on_duration_changed(self):
+        try:
+            v = float(self.edit_dur.text().replace(",", "."))
+            v = max(0.1, min(200.0, v))
+            self.rf_dur_ms = v
+            self.edit_dur.setText(f"{v:.2f}")
+        except ValueError:
+            self.edit_dur.setText(f"{self.rf_dur_ms:.2f}")
+        # resize canvas arrays preserving existing content
+        new_canvas = self.rf_dur_ms * self.CANVAS_MULT
+        old_canvas = self.canvas_dur_ms
+        if abs(new_canvas - old_canvas) > 1e-9:
+            new_N = self.N * self.CANVAS_MULT
+            old_N = len(self.rf_amp)
+            new_amp   = np.zeros(new_N)
+            new_phase = np.zeros(new_N)
+            copy_n = min(old_N, new_N)
+            new_amp[:copy_n]   = self.rf_amp[:copy_n]
+            new_phase[:copy_n] = self.rf_phase[:copy_n]
+            self.rf_amp   = new_amp
+            self.rf_phase = new_phase
+            self.canvas_dur_ms = new_canvas
+        self._update_rf_plot()
+        self._schedule_sim()
+
+    def _on_b1_changed(self):
+        try:
+            v = float(self.edit_b1.text().replace(",", "."))
+            v = max(0.1, min(500.0, v))
+            self.b1max_ut = v
+            self.edit_b1.setText(f"{v:.1f}")
+        except ValueError:
+            self.edit_b1.setText(f"{self.b1max_ut:.1f}")
+        # rescale current waveform peak to new B1 max
+        self._rescale_to_b1max()
+        self._update_rf_plot()
+        self._schedule_sim()
+
+    # ── preset & clear ─────────────────────────────────────────────────────────
+
+    def _apply_preset(self, name):
+        fn = PRESETS[name]
+        amp_rad, phase = fn(self.N, self.flip_deg, self.tbw)
+        peak = np.abs(amp_rad).max()
+        amp_scaled = amp_rad / peak * self.b1max_ut if peak > 1e-12 else np.zeros(self.N)
+        # Write preset into the active window only; rest of canvas is unchanged
+        idx = self._window_indices()
+        self.rf_amp[idx]   = amp_scaled
+        self.rf_phase[idx] = phase
+        self._update_rf_plot()
+        self._schedule_sim()
+
+    def _rescale_to_b1max(self):
+        """Rescale current waveform so peak abs == b1max_ut (preserves negative lobes)."""
+        peak = np.abs(self.rf_amp).max()
+        if peak > 1e-12:
+            self.rf_amp = self.rf_amp / peak * self.b1max_ut
+
+    def _on_clear(self):
+        """Clear the entire drawing canvas — all windows."""
+        self.rf_amp[:]   = 0.0
+        self.rf_phase[:] = 0.0
+        self._schedule_sim()
+        self._update_rf_plot()
+
+    # ── zoom helpers ───────────────────────────────────────────────────────────
+
+    def _all_profile_axes(self):
+        return (self.ax_mxy, self.ax_mz, self.ax_ph)
+
+    def _reset_zoom_rf(self):
+        """Snap RF x-axis back to full canvas width, y to data extent."""
+        self.ax_rf.set_xlim(0, self.canvas_dur_ms)
+        amax = max(np.abs(self.rf_amp).max(), 0.5)
+        pmax = max(np.abs(self.rf_phase).max(), 0.2)
+        top  = max(amax, pmax) * 1.15
+        self.ax_rf.set_ylim(-top * 0.6, top)
+        self.canvas.draw_idle()
+
+    def _reset_zoom_profiles(self):
+        """Snap profile axes back to full data x range."""
+        fov_m = self.slice_mm * 1e-3 * 6
+        x_mm  = np.array([-fov_m / 2, fov_m / 2]) * 1e3
+        for ax in self._all_profile_axes():
+            ax.set_xlim(x_mm[0], x_mm[1])
+        self.canvas.draw_idle()
+
+    # ── mouse drawing & zoom ───────────────────────────────────────────────────
+    #
+    # Button 1 (left)  on ax_rf  → draw amplitude or phase
+    # Button 3 (right) anywhere  → drag zoom:
+    #     RF panel   : horizontal drag → x zoom,  vertical drag → y zoom
+    #     Profile axes: horizontal drag → x zoom  (y is fixed / auto)
+    # Double-click right          → reset zoom on that panel
+    # Scroll wheel                → x-zoom centred on cursor (all axes same rule)
+
+    # ── canvas ↔ sample index helpers ─────────────────────────────────────────
+
+    @property
+    def _canvas_N(self):
+        return self.N * self.CANVAS_MULT
+
+    def _ms_to_ix(self, t_ms):
+        return int(np.clip(t_ms / self.canvas_dur_ms * self._canvas_N, 0, self._canvas_N - 1))
+
+    def _window_indices(self):
+        """Return the first N canvas indices (window is fixed at 0 → rf_dur_ms)."""
+        return np.arange(self.N)
+
+    def _event_to_ix(self, event):
+        if event.inaxes is not self.ax_rf:
+            return None, None
+        xl, xr = self.ax_rf.get_xlim()
+        yl, yu = self.ax_rf.get_ylim()
+        # map x from axis data coords → canvas sample index
+        frac = (event.xdata - 0.0) / self.canvas_dur_ms   # 0 to 1 across full canvas
+        ix   = int(np.clip(frac * self._canvas_N, 0, self._canvas_N - 1))
+        fy   = np.clip((event.ydata - yl) / (yu - yl), 0.0, 1.0)
+        return ix, fy
+
+    def _apply_stroke(self, ix, fy, last_ix):
+        i0 = last_ix if last_ix >= 0 else ix
+        i1 = ix
+        if i0 > i1:
+            i0, i1 = i1, i0
+        yl, yu = self.ax_rf.get_ylim()
+        data_val = fy * (yu - yl) + yl
+        for i in range(i0, i1 + 1):
+            if i < 0 or i >= self._canvas_N:
+                continue
+            if self._draw_mode == "amp":
+                self.rf_amp[i] = data_val
+            else:
+                self.rf_phase[i] = (fy - 0.5) * 2 * np.pi
+
+
+    def _on_press(self, event):
+        if event.inaxes is None:
+            return
+
+        # ── right-click: start zoom drag ──────────────────────────────────────
+        if event.button == 3:
+            # double-click right → reset
+            if event.dblclick:
+                if event.inaxes is self.ax_rf:
+                    self._reset_zoom_rf()
+                elif event.inaxes in self._all_profile_axes():
+                    self._reset_zoom_profiles()
+                return
+            self._zoom_active = True
+            self._zoom_ax     = event.inaxes
+            self._zoom_start_px  = (event.x, event.y)
+            ax = event.inaxes
+            self._zoom_start_lim = (*ax.get_xlim(), *ax.get_ylim())
+            return
+
+        # ── middle-click OR left-click in slide mode: shift the waveform ────────
+        if event.inaxes is self.ax_rf and event.xdata is not None:
+            if event.button == 2 or (event.button == 1 and self._draw_mode == 'slide'):
+                self._slide_active     = True
+                self._slide_drag_x0    = event.xdata
+                self._slide_amp_snap   = self.rf_amp.copy()
+                self._slide_phase_snap = self.rf_phase.copy()
+                return
+
+        # ── left-click on RF: draw amplitude or phase ─────────────────────────
+        if event.button == 1 and event.inaxes is self.ax_rf and self._draw_mode != 'slide':
+            self._drawing = True
+            ix, fy = self._event_to_ix(event)
+            if ix is not None:
+                self._last_ix = ix
+                self._apply_stroke(ix, fy, -1)
+                self._update_rf_plot()
+                self._schedule_sim()
+
+    def _on_move(self, event):
+        # ── waveform shift drag ────────────────────────────────────────────────
+        if self._slide_active and event.xdata is not None:
+            delta_ms  = event.xdata - self._slide_drag_x0
+            delta_smp = int(round(delta_ms / self.canvas_dur_ms * self._canvas_N))
+            # roll the snapshot by delta_smp samples
+            self.rf_amp   = np.roll(self._slide_amp_snap,   delta_smp)
+            self.rf_phase = np.roll(self._slide_phase_snap, delta_smp)
+            # zero-pad the end that wrapped around (no periodic extension)
+            if delta_smp > 0:
+                self.rf_amp[:delta_smp]   = 0.0
+                self.rf_phase[:delta_smp] = 0.0
+            elif delta_smp < 0:
+                self.rf_amp[delta_smp:]   = 0.0
+                self.rf_phase[delta_smp:] = 0.0
+            self._update_rf_plot()
+            self._schedule_sim()
+            return
+
+        # ── zoom drag ─────────────────────────────────────────────────────────
+        if self._zoom_active and self._zoom_ax is not None:
+            ax   = self._zoom_ax
+            xl0, xr0, yl0, yu0 = self._zoom_start_lim
+            px0, py0 = self._zoom_start_px
+            dx_px = event.x  - px0
+            dy_px = event.y  - py0
+
+            SENS = 200.0
+            x_factor = 2.0 ** (-dx_px / SENS)
+            x_center = (xl0 + xr0) / 2.0
+            x_half   = (xr0 - xl0) / 2.0 * x_factor
+            new_xl   = x_center - x_half
+            new_xr   = x_center + x_half
+            if new_xr - new_xl > 1e-9:
+                ax.set_xlim(new_xl, new_xr)
+
+            if ax is self.ax_rf:
+                y_factor = 2.0 ** (dy_px / SENS)
+                y_center = (yl0 + yu0) / 2.0
+                y_half   = (yu0 - yl0) / 2.0 * y_factor
+                new_yl   = y_center - y_half
+                new_yu   = y_center + y_half
+                if new_yu - new_yl > 1e-9:
+                    ax.set_ylim(new_yl, new_yu)
+
+            self.canvas.draw_idle()
+            return
+
+        # ── draw stroke ───────────────────────────────────────────────────────
+        if not self._drawing or event.inaxes is not self.ax_rf:
+            return
+        ix, fy = self._event_to_ix(event)
+        if ix is not None:
+            self._apply_stroke(ix, fy, self._last_ix)
+            self._last_ix = ix
+            self._update_rf_plot()
+            self._schedule_sim()
+
+    def _on_release(self, event):
+        if event.button == 3:
+            self._zoom_active = False
+            self._zoom_ax     = None
+        if event.button in (1, 2):
+            self._slide_active = False
+            self._slide_amp_snap   = None
+            self._slide_phase_snap = None
+        if event.button == 1:
+            self._drawing = False
+            self._last_ix = -1
+
+    def _on_scroll(self, event):
+        """Scroll wheel: zoom x-axis centred on cursor position."""
+        ax = event.inaxes
+        if ax is None:
+            return
+        FACTOR = 1.15
+        scale  = 1.0 / FACTOR if event.button == "up" else FACTOR
+        if event.xdata is None:
+            return
+        cx = event.xdata
+        xl, xr = ax.get_xlim()
+        new_xl = cx + (xl - cx) * scale
+        new_xr = cx + (xr - cx) * scale
+        if new_xr - new_xl > 1e-9:
+            ax.set_xlim(new_xl, new_xr)
+        self.canvas.draw_idle()
+
+    # ── simulation ─────────────────────────────────────────────────────────────
+
+    def _schedule_sim(self):
+        self._sim_timer.start(25)
+
+    def _required_gradient(self):
+        """
+        Compute the slice-select gradient (T/m) required so that the
+        requested slice thickness (mm) is achieved for the given TBW and
+        RF duration.
+
+        Physics:
+            BW_pulse  = TBW / T_RF          [Hz]
+            BW_spatial = γ · G · Δz          [Hz]
+            → G = TBW / (γ · T_RF · Δz)
+
+        This guarantees FWHM of |Mxy| = slice_mm when the pulse has
+        the correct TBW × duration product.
+        """
+        T_RF  = self.rf_dur_ms * 1e-3          # s
+        dz    = self.slice_mm  * 1e-3          # m
+        G     = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)   # T/m
+        return G
+
+    def _draw_fwhm(self, x_mm, mxy):
+        peak = mxy.max()
+        if peak < 0.01:
+            for ln in self._fwhm_lines: ln.set_visible(False)
+            return
+        idx = np.where(mxy >= peak * 0.5)[0]
+        if len(idx) >= 2:
+            for ln, xv in zip(self._fwhm_lines, [x_mm[idx[0]], x_mm[idx[-1]]]):
+                ln.set_xdata([xv, xv]); ln.set_visible(True)
+        else:
+            for ln in self._fwhm_lines: ln.set_visible(False)
+
+    def _update_window_overlay(self):
+        """Window is fixed at 0 → rf_dur_ms. Redraw when duration changes."""
+        self._win_span.remove()
+        self._win_span = self.ax_rf.axvspan(
+            0, self.rf_dur_ms, alpha=0.12, color="#ffa657", zorder=0
+        )
+        self._win_right.set_xdata([self.rf_dur_ms, self.rf_dur_ms])
+        self._win_label.set_text(f"active: 0 – {self.rf_dur_ms:.2f} ms")
+        self.canvas.draw_idle()
+
+    def _update_rf_plot(self):
+        """Redraw the full canvas waveform and the window overlay."""
+        t_ms = np.linspace(0, self.canvas_dur_ms, self._canvas_N)
+        self.line_amp.set_data(t_ms, self.rf_amp)
+        self.line_phs.set_data(t_ms, self.rf_phase)
+        self.ax_rf.set_xlim(0, self.canvas_dur_ms)
+        amax = max(np.abs(self.rf_amp).max(), 0.5)
+        pmax = max(np.abs(self.rf_phase).max(), 0.2)
+        top  = max(amax, pmax) * 1.15
+        bot  = -top * 0.6
+        self.ax_rf.set_ylim(bot, top)
+        self._update_window_overlay()
+
+    def _run_sim(self):
+        dur_s = self.rf_dur_ms * 1e-3
+        dt_s  = dur_s / self.N
+
+        # Extract exactly N samples from inside the active window
+        idx       = self._window_indices()
+        rf_amp_w  = self.rf_amp[idx].astype(np.float64)
+        rf_phs_w  = self.rf_phase[idx].astype(np.float64)
+
+        # B1 (µT) → flip angle per hard-pulse step (rad)
+        rf_rad = rf_amp_w * 1e-6 * GAMMA_RAD * dt_s
+
+        g_t_per_m = self._required_gradient()
+
+        fov_m   = self.slice_mm * 1e-3 * 6
+        x_m     = np.linspace(-fov_m / 2, fov_m / 2, self.n_slices)
+        x_mm    = x_m * 1e3
+        offsets = GAMMA_HZ_PER_T * g_t_per_m * x_m
+
+        Mxy, Mz = bloch_simulate(rf_rad, rf_phs_w, offsets, dt_s)
+
+        mxy_mag = np.abs(Mxy)
+        mxy_phs = np.angle(Mxy)
+
+        noise_floor    = max(mxy_mag.max() * 0.02, 0.01)
+        mxy_phs_masked = np.where(mxy_mag >= noise_floor, mxy_phs, np.nan)
+
+        self.line_mxy.set_data(x_mm, mxy_mag)
+        self.ax_mxy.set_xlim(x_mm[0], x_mm[-1])
+        self.ax_mxy.set_ylim(-0.02, max(mxy_mag.max() * 1.1, 0.05))
+
+        self.line_mz.set_data(x_mm, Mz)
+        self.ax_mz.set_xlim(x_mm[0], x_mm[-1])
+        self.ax_mz.set_ylim(min(-1.05, Mz.min() - 0.05), 1.05)
+
+        self.line_phase.set_data(x_mm, mxy_phs_masked)
+        self.ax_ph.set_xlim(x_mm[0], x_mm[-1])
+        self.ax_ph.set_ylim(-np.pi - 0.2, np.pi + 0.2)
+
+        self._draw_fwhm(x_mm, mxy_mag)
+        self._update_status(x_mm, mxy_mag, Mz, rf_rad, dur_s, g_t_per_m)
+        self.canvas.draw_idle()
+
+    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m):
+        peak     = mxy.max()
+        flip_eff = np.rad2deg(np.arcsin(np.clip(peak, 0, 1)))
+        sum_flip = np.rad2deg(rf_rad.sum())
+
+        idx  = np.where(mxy >= peak * 0.5)[0]
+        fwhm = (x_mm[idx[-1]] - x_mm[idx[0]]) if len(idx) >= 2 else 0.0
+
+        g_mt_per_m = g_t_per_m * 1e3
+
+        self.lbl_grad_computed.setText(f"{g_mt_per_m:.2f}")
+
+        self.status.showMessage(
+            f"  Peak |Mxy|: {peak:.3f}"
+            f"   |   Eff. flip: {flip_eff:.1f}°"
+            f"   |   ΣB1·γ·dt: {sum_flip:.1f}°"
+            f"   |   FWHM: {fwhm:.2f} mm  (target: {self.slice_mm:.1f} mm)"
+            f"   |   G_slice: {g_mt_per_m:.2f} mT/m  [computed]"
+            f"   |   Mz(centre): {Mz[len(Mz)//2]:.3f}"
+        )
+
+
+# ── entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window,          QColor("#161b22"))
+    pal.setColor(QPalette.WindowText,      QColor("#c9d1d9"))
+    pal.setColor(QPalette.Base,            QColor("#0d1117"))
+    pal.setColor(QPalette.AlternateBase,   QColor("#161b22"))
+    pal.setColor(QPalette.ToolTipBase,     QColor("#c9d1d9"))
+    pal.setColor(QPalette.ToolTipText,     QColor("#c9d1d9"))
+    pal.setColor(QPalette.Text,            QColor("#c9d1d9"))
+    pal.setColor(QPalette.Button,          QColor("#21262d"))
+    pal.setColor(QPalette.ButtonText,      QColor("#c9d1d9"))
+    pal.setColor(QPalette.Highlight,       QColor("#1f6feb"))
+    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.Mid,             QColor("#30363d"))
+    app.setPalette(pal)
+
+    # warm up Numba JIT before window appears (compiles on tiny dummy arrays)
+    _warmup_bloch()
+
+    win = RFSimulator()
+    numba_str = f"numba {numba.__version__} ✓" if _NUMBA_AVAILABLE else "numba not installed — using numpy fallback"
+    win.setWindowTitle(f"RF Pulse Bloch Simulator  [{numba_str}]")
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
