@@ -266,12 +266,19 @@ class RFSimulator(QMainWindow):
         self._draw_mode = "amp"   # "amp" | "phase" | "slide"
         self._last_ix   = -1
 
-        # waveform-slide state (the window is fixed at 0→rf_dur_ms;
-        # in slide mode we shift the waveform data along the canvas)
-        self._slide_active  = False
-        self._slide_drag_x0 = 0.0          # canvas x (ms) at drag start
-        self._slide_amp_snap   = None      # snapshot of rf_amp at drag start
+        # window: always starts at 0, right edge is draggable
+        # win_end_ms is the actual RF duration used for the Bloch sim
+        self.win_end_ms = 4.0        # initialised equal to rf_dur_ms, then user can resize
+
+        # waveform-slide state
+        self._slide_active     = False
+        self._slide_drag_x0    = 0.0
+        self._slide_amp_snap   = None
         self._slide_phase_snap = None
+
+        # window-resize drag state
+        self._resize_active = False
+        self._RESIZE_TOL_MS = 0.0   # set after canvas_dur_ms is known
 
         # zoom state — one entry per axis, stores (xl, xr, yl, yu) at drag start
         # and pixel position at drag start
@@ -284,12 +291,15 @@ class RFSimulator(QMainWindow):
         self.rf_dur_ms  = 4.0
         self.flip_deg   = 90.0
         self.tbw        = 4.0
-        self.b1max_ut   = 15.0
+        self.b0_T       = 3.0
         self.slice_mm   = 5.0
         self.canvas_dur_ms = self.rf_dur_ms * self.CANVAS_MULT
+        self.win_end_ms    = self.rf_dur_ms          # window right edge
+        self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02  # snap zone near right edge
 
         self._build_ui()
         self._connect_signals()
+        self._on_b0_changed(1)          # trigger 3T defaults (Larmor title + B1 suggestion)
         self._apply_preset("Sinc + Hann")
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -402,18 +412,25 @@ class RFSimulator(QMainWindow):
         g6l.addWidget(self.sl_slice); g6l.addWidget(self.lbl_slice)
         row.addWidget(g6)
 
-        # B1 max — typed, fixed value like duration
-        g7 = QGroupBox("B1 max")
+        # B0 field strength selector
+        g_b0 = QGroupBox("B0 field")
+        g_b0l = QHBoxLayout(g_b0); g_b0l.setContentsMargins(6, 2, 6, 4); g_b0l.setSpacing(4)
+        self.cb_b0 = QComboBox()
+        self.cb_b0.addItems(["1.5 T", "3.0 T", "7.0 T"])
+        self.cb_b0.setCurrentIndex(1)   # default 3T
+        self.cb_b0.setMinimumWidth(68)
+        g_b0l.addWidget(self.cb_b0)
+        row.addWidget(g_b0)
+
+        # B1 peak — computed from flip angle, pulse shape, and duration (read-only)
+        g7 = QGroupBox("B1 peak (computed)")
         g7l = QHBoxLayout(g7); g7l.setContentsMargins(6, 2, 6, 4); g7l.setSpacing(4)
-        self.edit_b1 = QLineEdit("15.0")
-        self.edit_b1.setFixedWidth(52)
-        self.edit_b1.setValidator(QDoubleValidator(0.1, 500.0, 1))
-        self.edit_b1.setAlignment(Qt.AlignRight)
-        self.edit_b1.setStyleSheet(
-            "background:#0d1117; color:#c9d1d9; border:1px solid #30363d;"
-            "border-radius:4px; padding:1px 4px; font-size:12px;"
+        self.lbl_b1_computed = QLabel("—")
+        self.lbl_b1_computed.setStyleSheet(
+            "color:#ffa657; font-size:12px; font-weight:500;"
         )
-        g7l.addWidget(self.edit_b1); g7l.addWidget(self._lbl("µT"))
+        self.lbl_b1_computed.setMinimumWidth(52)
+        g7l.addWidget(self.lbl_b1_computed); g7l.addWidget(self._lbl("µT"))
         row.addWidget(g7)
 
         # Gradient max — computed from TBW / (γ · T_RF · Δz), read-only display
@@ -470,24 +487,23 @@ class RFSimulator(QMainWindow):
         x_mm = np.linspace(-self.slice_mm * 3, self.slice_mm * 3, self.n_slices)
 
         # RF — x-axis spans the full canvas (4× rf_dur_ms)
-        self.line_amp, = self.ax_rf.plot(t_ms, np.zeros(len(t_ms)), color="#58a6ff", lw=1.8, label="B1 (µT)")
+        self.line_amp, = self.ax_rf.plot(t_ms, np.zeros(len(t_ms)), color="#58a6ff", lw=1.8, label="shape (norm.)")
         self.line_phs, = self.ax_rf.plot(t_ms, np.zeros(len(t_ms)), color="#ff7b72", lw=1.2, ls="--", alpha=0.85, label="phase (rad)")
         self.ax_rf.axhline(0, color=SP, lw=0.5)
         self.ax_rf.set_xlim(0, self.canvas_dur_ms)
         self.ax_rf.set_xlabel("time (ms)  [full drawing canvas]", fontsize=8, color=TC)
-        self.ax_rf.set_ylabel("B1 (µT)  /  phase (rad)", fontsize=8, color=TC)
+        self.ax_rf.set_ylabel("normalised amplitude  /  phase (rad)", fontsize=8, color=TC)
         self.ax_rf.legend(loc="upper right", fontsize=8, facecolor=FIG, edgecolor=SP, labelcolor="#c9d1d9")
 
-        # Active window highlight — always fixed at 0 → rf_dur_ms
+        # Active window — left edge fixed at 0, right edge draggable
         self._win_span = self.ax_rf.axvspan(
-            0, self.rf_dur_ms,
-            alpha=0.12, color="#ffa657", zorder=0
+            0, self.win_end_ms, alpha=0.12, color="#ffa657", zorder=0
         )
-        self._win_left  = self.ax_rf.axvline(0,               color="#ffa657", lw=1.2, ls="--", zorder=3)
-        self._win_right = self.ax_rf.axvline(self.rf_dur_ms,  color="#ffa657", lw=1.2, ls="--", zorder=3)
+        self._win_left  = self.ax_rf.axvline(0,                color="#ffa657", lw=1.2, ls="--", zorder=3)
+        self._win_right = self.ax_rf.axvline(self.win_end_ms,  color="#ffa657", lw=2.0, ls="-",  zorder=4)
         self._win_label = self.ax_rf.text(
-            self.rf_dur_ms * 0.02, 0.97,
-            f"active: 0 – {self.rf_dur_ms:.2f} ms",
+            self.win_end_ms * 0.02, 0.97,
+            f"window: 0 – {self.win_end_ms:.2f} ms  |  drag right edge to resize",
             transform=self.ax_rf.get_xaxis_transform(),
             fontsize=7, color="#ffa657", va="top"
         )
@@ -539,8 +555,8 @@ class RFSimulator(QMainWindow):
         self._mode_group.addButton(self.rb_phase, 1)
         self._mode_group.addButton(self.rb_slide, 2)
         self._mode_group.idClicked.connect(self._on_mode_changed)
+        self.cb_b0.currentIndexChanged.connect(self._on_b0_changed)
         self.edit_dur.editingFinished.connect(self._on_duration_changed)
-        self.edit_b1.editingFinished.connect(self._on_b1_changed)
 
         def _sl(sl, lbl, suffix, attr):
             def _f(v):
@@ -591,20 +607,9 @@ class RFSimulator(QMainWindow):
             new_phase[:copy_n] = self.rf_phase[:copy_n]
             self.rf_amp   = new_amp
             self.rf_phase = new_phase
-            self.canvas_dur_ms = new_canvas
-        self._update_rf_plot()
-        self._schedule_sim()
-
-    def _on_b1_changed(self):
-        try:
-            v = float(self.edit_b1.text().replace(",", "."))
-            v = max(0.1, min(500.0, v))
-            self.b1max_ut = v
-            self.edit_b1.setText(f"{v:.1f}")
-        except ValueError:
-            self.edit_b1.setText(f"{self.b1max_ut:.1f}")
-        # rescale current waveform peak to new B1 max
-        self._rescale_to_b1max()
+            self.canvas_dur_ms  = new_canvas
+            self.win_end_ms     = self.rf_dur_ms   # reset window to match new duration
+            self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
         self._update_rf_plot()
         self._schedule_sim()
 
@@ -613,25 +618,34 @@ class RFSimulator(QMainWindow):
     def _apply_preset(self, name):
         fn = PRESETS[name]
         amp_rad, phase = fn(self.N, self.flip_deg, self.tbw)
+        # Store waveform as normalised shape: peak absolute value = 1.0
+        # B1 peak is computed from this shape + flip angle + duration in _run_sim
         peak = np.abs(amp_rad).max()
-        amp_scaled = amp_rad / peak * self.b1max_ut if peak > 1e-12 else np.zeros(self.N)
-        # Write preset into the active window only; rest of canvas is unchanged
+        amp_norm = amp_rad / peak if peak > 1e-12 else np.zeros(self.N)
         idx = self._window_indices()
-        self.rf_amp[idx]   = amp_scaled
+        self.rf_amp[idx]   = amp_norm
         self.rf_phase[idx] = phase
         self._update_rf_plot()
         self._schedule_sim()
 
-    def _rescale_to_b1max(self):
-        """Rescale current waveform so peak abs == b1max_ut (preserves negative lobes)."""
-        peak = np.abs(self.rf_amp).max()
-        if peak > 1e-12:
-            self.rf_amp = self.rf_amp / peak * self.b1max_ut
+    def _on_b0_changed(self, idx):
+        """B0 field selection — updates Larmor frequency and window title."""
+        b0_map = {0: 1.5, 1: 3.0, 2: 7.0}
+        self.b0_T = b0_map.get(idx, 3.0)
+        larmor_mhz = GAMMA_HZ_PER_T * self.b0_T / 1e6
+        self.setWindowTitle(
+            f"RF Pulse Bloch Simulator  —  B0={self.b0_T:.1f} T  "
+            f"(Larmor {larmor_mhz:.1f} MHz)"
+        )
+        self._schedule_sim()
 
     def _on_clear(self):
-        """Clear the entire drawing canvas — all windows."""
+        """Clear entire canvas and reset window to default (rf_dur_ms)."""
         self.rf_amp[:]   = 0.0
         self.rf_phase[:] = 0.0
+        # reset window right edge back to nominal rf duration
+        self.win_end_ms = self.rf_dur_ms
+        self._update_window_overlay()
         self._schedule_sim()
         self._update_rf_plot()
 
@@ -676,8 +690,15 @@ class RFSimulator(QMainWindow):
         return int(np.clip(t_ms / self.canvas_dur_ms * self._canvas_N, 0, self._canvas_N - 1))
 
     def _window_indices(self):
-        """Return the first N canvas indices (window is fixed at 0 → rf_dur_ms)."""
-        return np.arange(self.N)
+        """
+        Resample the canvas region [0, win_end_ms] into exactly N indices.
+        Whatever the window width, the Bloch sim always gets N samples.
+        A narrow window → small dt (high resolution).
+        A wide window  → large dt (lower resolution, longer effective pulse).
+        """
+        i_end = max(1, self._ms_to_ix(self.win_end_ms))
+        idx   = np.round(np.linspace(0, i_end - 1, self.N)).astype(int)
+        return np.clip(idx, 0, self._canvas_N - 1)
 
     def _event_to_ix(self, event):
         if event.inaxes is not self.ax_rf:
@@ -726,6 +747,13 @@ class RFSimulator(QMainWindow):
             self._zoom_start_lim = (*ax.get_xlim(), *ax.get_ylim())
             return
 
+        # ── left-click near right window edge: resize window ─────────────────
+        if event.button == 1 and event.inaxes is self.ax_rf and event.xdata is not None:
+            tol = self._RESIZE_TOL_MS
+            if abs(event.xdata - self.win_end_ms) <= tol:
+                self._resize_active = True
+                return
+
         # ── middle-click OR left-click in slide mode: shift the waveform ────────
         if event.inaxes is self.ax_rf and event.xdata is not None:
             if event.button == 2 or (event.button == 1 and self._draw_mode == 'slide'):
@@ -746,6 +774,24 @@ class RFSimulator(QMainWindow):
                 self._schedule_sim()
 
     def _on_move(self, event):
+        # ── update cursor near right window edge ──────────────────────────────
+        if event.inaxes is self.ax_rf and event.xdata is not None and not self._slide_active and not self._zoom_active:
+            if abs(event.xdata - self.win_end_ms) <= self._RESIZE_TOL_MS:
+                self.canvas.setCursor(Qt.SplitHCursor)
+            elif self._draw_mode == 'slide':
+                self.canvas.setCursor(Qt.SizeHorCursor)
+            else:
+                self.canvas.setCursor(Qt.CrossCursor)
+
+        # ── window resize drag ────────────────────────────────────────────────
+        if self._resize_active and event.xdata is not None:
+            new_end = max(self.canvas_dur_ms * 0.01, min(self.canvas_dur_ms, event.xdata))
+            self.win_end_ms = new_end
+            self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
+            self._update_window_overlay()
+            self._schedule_sim()
+            return
+
         # ── waveform shift drag ────────────────────────────────────────────────
         if self._slide_active and event.xdata is not None:
             delta_ms  = event.xdata - self._slide_drag_x0
@@ -808,7 +854,8 @@ class RFSimulator(QMainWindow):
             self._zoom_active = False
             self._zoom_ax     = None
         if event.button in (1, 2):
-            self._slide_active = False
+            self._slide_active  = False
+            self._resize_active = False
             self._slide_amp_snap   = None
             self._slide_phase_snap = None
         if event.button == 1:
@@ -869,13 +916,19 @@ class RFSimulator(QMainWindow):
             for ln in self._fwhm_lines: ln.set_visible(False)
 
     def _update_window_overlay(self):
-        """Window is fixed at 0 → rf_dur_ms. Redraw when duration changes."""
+        """Redraw overlay. Left edge fixed at 0, right edge = win_end_ms."""
         self._win_span.remove()
         self._win_span = self.ax_rf.axvspan(
-            0, self.rf_dur_ms, alpha=0.12, color="#ffa657", zorder=0
+            0, self.win_end_ms, alpha=0.12, color="#ffa657", zorder=0
         )
-        self._win_right.set_xdata([self.rf_dur_ms, self.rf_dur_ms])
-        self._win_label.set_text(f"active: 0 – {self.rf_dur_ms:.2f} ms")
+        self._win_right.set_xdata([self.win_end_ms, self.win_end_ms])
+        eff_dt_us = self.win_end_ms * 1e3 / self.N   # µs per sample
+        self._win_label.set_text(
+            f"window: 0 – {self.win_end_ms:.2f} ms"
+            f"  |  scaled to rf_dur={self.rf_dur_ms:.2f} ms"
+            f"  |  eff. dt={eff_dt_us:.2f} µs/sample"
+            f"  |  drag right edge ↔ to resize"
+        )
         self.canvas.draw_idle()
 
     def _update_rf_plot(self):
@@ -892,16 +945,28 @@ class RFSimulator(QMainWindow):
         self._update_window_overlay()
 
     def _run_sim(self):
-        dur_s = self.rf_dur_ms * 1e-3
-        dt_s  = dur_s / self.N
+        eff_dur_s = self.win_end_ms * 1e-3
+        dt_s      = eff_dur_s / self.N
 
-        # Extract exactly N samples from inside the active window
+        # Extract N resampled samples from the window (normalised shape, −1..1)
         idx       = self._window_indices()
-        rf_amp_w  = self.rf_amp[idx].astype(np.float64)
+        shape_w   = self.rf_amp[idx].astype(np.float64)     # normalised shape
         rf_phs_w  = self.rf_phase[idx].astype(np.float64)
 
-        # B1 (µT) → flip angle per hard-pulse step (rad)
-        rf_rad = rf_amp_w * 1e-6 * GAMMA_RAD * dt_s
+        # Compute B1 peak from the desired flip angle and pulse shape integral:
+        #   flip_rad = γ · B1_peak · ∫|shape(t)| dt
+        #            = γ · B1_peak · dt · Σ|shape[i]|
+        #   → B1_peak (T) = flip_rad / (γ · dt · Σ|shape[i]|)
+        shape_integral = np.abs(shape_w).sum()
+        flip_rad = np.deg2rad(self.flip_deg)
+        if shape_integral > 1e-12:
+            b1_peak_T  = flip_rad / (GAMMA_RAD * dt_s * shape_integral)
+        else:
+            b1_peak_T  = 0.0
+        b1_peak_uT = b1_peak_T * 1e6
+
+        # Scale shape to physical B1 amplitude for the Bloch sim
+        rf_rad = shape_w * b1_peak_T * GAMMA_RAD * dt_s   # flip-angle per step (rad)
 
         g_t_per_m = self._required_gradient()
 
@@ -931,10 +996,10 @@ class RFSimulator(QMainWindow):
         self.ax_ph.set_ylim(-np.pi - 0.2, np.pi + 0.2)
 
         self._draw_fwhm(x_mm, mxy_mag)
-        self._update_status(x_mm, mxy_mag, Mz, rf_rad, dur_s, g_t_per_m)
+        self._update_status(x_mm, mxy_mag, Mz, rf_rad, eff_dur_s, g_t_per_m, b1_peak_uT)
         self.canvas.draw_idle()
 
-    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m):
+    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT):
         peak     = mxy.max()
         flip_eff = np.rad2deg(np.arcsin(np.clip(peak, 0, 1)))
         sum_flip = np.rad2deg(rf_rad.sum())
@@ -944,14 +1009,18 @@ class RFSimulator(QMainWindow):
 
         g_mt_per_m = g_t_per_m * 1e3
 
+        # update toolbar computed labels
         self.lbl_grad_computed.setText(f"{g_mt_per_m:.2f}")
+        self.lbl_b1_computed.setText(f"{b1_peak_uT:.2f}")
 
+        larmor_mhz = GAMMA_HZ_PER_T * self.b0_T / 1e6
         self.status.showMessage(
-            f"  Peak |Mxy|: {peak:.3f}"
+            f"  B0={self.b0_T:.1f}T  f₀={larmor_mhz:.1f}MHz"
+            f"   |   B1peak={b1_peak_uT:.2f}µT  G={g_mt_per_m:.2f}mT/m  [computed]"
+            f"   |   Peak |Mxy|: {peak:.3f}"
             f"   |   Eff. flip: {flip_eff:.1f}°"
-            f"   |   ΣB1·γ·dt: {sum_flip:.1f}°"
             f"   |   FWHM: {fwhm:.2f} mm  (target: {self.slice_mm:.1f} mm)"
-            f"   |   G_slice: {g_mt_per_m:.2f} mT/m  [computed]"
+            f"   |   Window: {self.win_end_ms:.2f} ms  (nominal: {self.rf_dur_ms:.2f} ms)"
             f"   |   Mz(centre): {Mz[len(Mz)//2]:.3f}"
         )
 
