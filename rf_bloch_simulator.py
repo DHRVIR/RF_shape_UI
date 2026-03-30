@@ -449,6 +449,22 @@ class RFSimulator(QMainWindow):
         self.btn_clear.setFixedWidth(52)
         row.addWidget(self.btn_clear)
 
+        # Brush smoothness
+        g_brush = QGroupBox("Brush smooth")
+        g_brushl = QHBoxLayout(g_brush); g_brushl.setContentsMargins(6, 2, 6, 4); g_brushl.setSpacing(4)
+        self.sl_brush = QSlider(Qt.Horizontal)
+        self.sl_brush.setRange(1, 40); self.sl_brush.setValue(8)
+        self.sl_brush.setFixedWidth(70)
+        self.lbl_brush = QLabel("8"); self.lbl_brush.setMinimumWidth(16)
+        g_brushl.addWidget(self.sl_brush); g_brushl.addWidget(self.lbl_brush)
+        row.addWidget(g_brush)
+
+        # Smooth button — post-process the whole canvas
+        self.btn_smooth = QPushButton("Smooth")
+        self.btn_smooth.setFixedWidth(60)
+        self.btn_smooth.setToolTip("Apply Savitzky-Golay smoothing to entire canvas")
+        row.addWidget(self.btn_smooth)
+
         row.addStretch()
         return row
 
@@ -548,6 +564,10 @@ class RFSimulator(QMainWindow):
             lambda _: self._apply_preset(self.cb_preset.currentText())
         )
         self.btn_clear.clicked.connect(self._on_clear)
+        self.btn_smooth.clicked.connect(self._on_smooth)
+        self.sl_brush.valueChanged.connect(
+            lambda v: self.lbl_brush.setText(str(v))
+        )
 
         from PyQt5.QtWidgets import QButtonGroup
         self._mode_group = QButtonGroup(self)
@@ -712,20 +732,69 @@ class RFSimulator(QMainWindow):
         return ix, fy
 
     def _apply_stroke(self, ix, fy, last_ix):
-        i0 = last_ix if last_ix >= 0 else ix
-        i1 = ix
-        if i0 > i1:
-            i0, i1 = i1, i0
-        yl, yu = self.ax_rf.get_ylim()
-        data_val = fy * (yu - yl) + yl
-        for i in range(i0, i1 + 1):
-            if i < 0 or i >= self._canvas_N:
-                continue
-            if self._draw_mode == "amp":
-                self.rf_amp[i] = data_val
-            else:
-                self.rf_phase[i] = (fy - 0.5) * 2 * np.pi
+        """
+        Paint with a Gaussian brush instead of a hard pixel write.
+        Brush radius comes from sl_brush (canvas samples).
+        Blends the target value into surrounding samples weighted by a
+        Gaussian — gives smooth, arc-like curves even with jerky mouse moves.
+        """
+        yl, yu   = self.ax_rf.get_ylim()
+        radius   = max(1, self.sl_brush.value())
+        is_amp   = (self._draw_mode == 'amp')
+        target   = fy * (yu - yl) + yl if is_amp else (fy - 0.5) * 2 * np.pi
 
+        # fill gaps between last position and current position
+        i0     = last_ix if last_ix >= 0 else ix
+        i1     = ix
+        steps  = max(1, abs(i1 - i0))
+        points = np.round(np.linspace(i0, i1, steps + 1)).astype(int)
+
+        # Gaussian kernel: sigma = radius/2, extent = ±2*radius
+        r     = radius * 2
+        kx    = np.arange(-r, r + 1)
+        sigma = max(radius * 0.5, 0.5)
+        gauss = np.exp(-0.5 * (kx / sigma) ** 2)
+        gauss /= gauss.max()   # peak weight = 1 → centre hits target exactly
+
+        arr = self.rf_amp if is_amp else self.rf_phase
+        for cx in points:
+            for ki, k in enumerate(kx):
+                si = int(cx + k)
+                if 0 <= si < self._canvas_N:
+                    w       = gauss[ki]
+                    arr[si] = arr[si] * (1.0 - w) + target * w
+        if is_amp:
+            self.rf_amp   = arr
+        else:
+            self.rf_phase = arr
+
+    def _on_smooth(self):
+        """
+        Post-process: Savitzky-Golay smooth over the whole canvas.
+        Window size scales with brush radius. Peak amplitude is preserved.
+        """
+        from scipy.signal import savgol_filter
+        radius = max(1, self.sl_brush.value())
+        win    = radius * 4 + 1
+        if win % 2 == 0:
+            win += 1
+        win  = max(5, win)
+        poly = min(3, win - 1)
+
+        peak_before = np.abs(self.rf_amp).max()
+        if peak_before > 1e-12:
+            smoothed = savgol_filter(self.rf_amp, win, poly)
+            peak_after = np.abs(smoothed).max()
+            if peak_after > 1e-12:
+                self.rf_amp = smoothed / peak_after * peak_before
+            else:
+                self.rf_amp = smoothed
+
+        if np.any(self.rf_phase != 0):
+            self.rf_phase = savgol_filter(self.rf_phase, win, poly)
+
+        self._update_rf_plot()
+        self._schedule_sim()
 
     def _on_press(self, event):
         if event.inaxes is None:
