@@ -266,9 +266,10 @@ class RFSimulator(QMainWindow):
         self._draw_mode = "amp"   # "amp" | "phase" | "slide"
         self._last_ix   = -1
 
-        # window: always starts at 0, right edge is draggable
-        # win_end_ms is the actual RF duration used for the Bloch sim
-        self.win_end_ms = 4.0        # initialised equal to rf_dur_ms, then user can resize
+        # window: both edges are draggable
+        # win_start_ms = left edge,  win_end_ms = right edge
+        self.win_start_ms = 0.0
+        self.win_end_ms   = 4.0      # initialised equal to rf_dur_ms
 
         # waveform-slide state
         self._slide_active     = False
@@ -276,9 +277,12 @@ class RFSimulator(QMainWindow):
         self._slide_amp_snap   = None
         self._slide_phase_snap = None
 
-        # window-resize drag state
-        self._resize_active = False
-        self._RESIZE_TOL_MS = 0.0   # set after canvas_dur_ms is known
+        # window-resize drag state — separate flag for left/right edge
+        self._resize_left        = False
+        self._resize_right       = False
+        self._resize_amp_snap    = None   # full canvas snapshot at drag start
+        self._resize_phase_snap  = None
+        self._RESIZE_TOL_MS      = 0.0
 
         # zoom state — one entry per axis, stores (xl, xr, yl, yu) at drag start
         # and pixel position at drag start
@@ -294,8 +298,9 @@ class RFSimulator(QMainWindow):
         self.b0_T       = 3.0
         self.slice_mm   = 5.0
         self.canvas_dur_ms = self.rf_dur_ms * self.CANVAS_MULT
-        self.win_end_ms    = self.rf_dur_ms          # window right edge
-        self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02  # snap zone near right edge
+        self.win_start_ms   = 0.0
+        self.win_end_ms     = self.rf_dur_ms
+        self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
 
         self._build_ui()
         self._connect_signals()
@@ -511,15 +516,15 @@ class RFSimulator(QMainWindow):
         self.ax_rf.set_ylabel("normalised amplitude  /  phase (rad)", fontsize=8, color=TC)
         self.ax_rf.legend(loc="upper right", fontsize=8, facecolor=FIG, edgecolor=SP, labelcolor="#c9d1d9")
 
-        # Active window — left edge fixed at 0, right edge draggable
+        # Active window — both edges draggable
         self._win_span = self.ax_rf.axvspan(
-            0, self.win_end_ms, alpha=0.12, color="#ffa657", zorder=0
+            self.win_start_ms, self.win_end_ms, alpha=0.12, color="#ffa657", zorder=0
         )
-        self._win_left  = self.ax_rf.axvline(0,                color="#ffa657", lw=1.2, ls="--", zorder=3)
-        self._win_right = self.ax_rf.axvline(self.win_end_ms,  color="#ffa657", lw=2.0, ls="-",  zorder=4)
+        self._win_left  = self.ax_rf.axvline(self.win_start_ms, color="#ffa657", lw=2.0, ls="-", zorder=4)
+        self._win_right = self.ax_rf.axvline(self.win_end_ms,   color="#ffa657", lw=2.0, ls="-", zorder=4)
         self._win_label = self.ax_rf.text(
-            self.win_end_ms * 0.02, 0.97,
-            f"window: 0 – {self.win_end_ms:.2f} ms  |  drag right edge to resize",
+            self.win_start_ms + (self.win_end_ms - self.win_start_ms) * 0.02, 0.97,
+            f"window: {self.win_start_ms:.2f} – {self.win_end_ms:.2f} ms  |  drag either edge to resize",
             transform=self.ax_rf.get_xaxis_transform(),
             fontsize=7, color="#ffa657", va="top"
         )
@@ -628,7 +633,8 @@ class RFSimulator(QMainWindow):
             self.rf_amp   = new_amp
             self.rf_phase = new_phase
             self.canvas_dur_ms  = new_canvas
-            self.win_end_ms     = self.rf_dur_ms   # reset window to match new duration
+            self.win_start_ms   = 0.0
+            self.win_end_ms     = self.rf_dur_ms
             self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
         self._update_rf_plot()
         self._schedule_sim()
@@ -664,7 +670,8 @@ class RFSimulator(QMainWindow):
         self.rf_amp[:]   = 0.0
         self.rf_phase[:] = 0.0
         # reset window right edge back to nominal rf duration
-        self.win_end_ms = self.rf_dur_ms
+        self.win_start_ms   = 0.0
+        self.win_end_ms     = self.rf_dur_ms
         self._update_window_overlay()
         self._schedule_sim()
         self._update_rf_plot()
@@ -711,13 +718,12 @@ class RFSimulator(QMainWindow):
 
     def _window_indices(self):
         """
-        Resample the canvas region [0, win_end_ms] into exactly N indices.
-        Whatever the window width, the Bloch sim always gets N samples.
-        A narrow window → small dt (high resolution).
-        A wide window  → large dt (lower resolution, longer effective pulse).
+        Resample the canvas region [win_start_ms, win_end_ms] into N indices.
+        Both edges are user-adjustable. The window width determines effective dt.
         """
-        i_end = max(1, self._ms_to_ix(self.win_end_ms))
-        idx   = np.round(np.linspace(0, i_end - 1, self.N)).astype(int)
+        i0  = self._ms_to_ix(self.win_start_ms)
+        i1  = max(i0 + 1, self._ms_to_ix(self.win_end_ms))
+        idx = np.round(np.linspace(i0, i1 - 1, self.N)).astype(int)
         return np.clip(idx, 0, self._canvas_N - 1)
 
     def _event_to_ix(self, event):
@@ -768,6 +774,70 @@ class RFSimulator(QMainWindow):
         else:
             self.rf_phase = arr
 
+    def _commit_window_resize(self):
+        """
+        On window-edge release — rescale the ENTIRE canvas proportionally.
+
+        The window defines which region is "active", but the whole canvas
+        is resampled so that:
+          - The window region maps to [0 → rf_dur_ms] (first N positions)
+          - Everything outside the window is scaled by the same factor
+            and placed after rf_dur_ms on the canvas
+
+        This keeps the whole pulse proportionally correct so subsequent
+        window adjustments always see a consistent, properly scaled canvas.
+
+        Scale factor = rf_dur_ms / win_dur_ms
+          - Narrow window (crop) → factor > 1 → canvas content stretched
+          - Wide window (expand) → factor < 1 → canvas content compressed
+        """
+        snap_amp   = self._resize_amp_snap
+        snap_phase = self._resize_phase_snap
+        if snap_amp is None:
+            self.win_start_ms = 0.0
+            self.win_end_ms   = self.rf_dur_ms
+            self._update_rf_plot()
+            self._schedule_sim()
+            return
+
+        win_dur_ms = max(0.001, self.win_end_ms - self.win_start_ms)
+
+        # Scale factor: how much does the canvas content need to stretch/compress
+        # so that the selected window fills rf_dur_ms exactly.
+        scale = self.rf_dur_ms / win_dur_ms   # >1 = stretch, <1 = compress
+
+        # The new canvas represents: original_canvas_dur * scale in time
+        # We resample the entire snapshot into canvas_N points, but shifted
+        # so that win_start_ms maps to t=0.
+
+        # Original canvas time axis (ms):  0 → canvas_dur_ms
+        # After scaling, win_start → 0, and everything shifts and scales.
+        # New time axis: (orig_t - win_start_ms) * scale → fills canvas
+
+        # Resample: for each new canvas position i, find the original position
+        #   orig_t = win_start_ms + new_t / scale
+        # where new_t goes from 0 → canvas_dur_ms
+
+        new_t_ms  = np.linspace(0, self.canvas_dur_ms, self._canvas_N)
+        orig_t_ms = self.win_start_ms + new_t_ms / scale   # map back to snapshot
+
+        # Convert original time to fractional index in snapshot
+        orig_frac = orig_t_ms / self.canvas_dur_ms * (self._canvas_N - 1)
+        orig_frac = np.clip(orig_frac, 0, self._canvas_N - 1)
+
+        self.rf_amp   = np.interp(orig_frac,
+                                  np.arange(self._canvas_N), snap_amp)
+        self.rf_phase = np.interp(orig_frac,
+                                  np.arange(self._canvas_N), snap_phase)
+
+        # Reset window to 0 → rf_dur_ms
+        self.win_start_ms = 0.0
+        self.win_end_ms   = self.rf_dur_ms
+
+        # Redraw and recalculate everything
+        self._update_rf_plot()
+        self._schedule_sim()
+
     def _on_smooth(self):
         """
         Post-process: Savitzky-Golay smooth over the whole canvas.
@@ -816,11 +886,24 @@ class RFSimulator(QMainWindow):
             self._zoom_start_lim = (*ax.get_xlim(), *ax.get_ylim())
             return
 
-        # ── left-click near right window edge: resize window ─────────────────
+        # ── left-click near window edge: resize left or right edge ──────────
         if event.button == 1 and event.inaxes is self.ax_rf and event.xdata is not None:
             tol = self._RESIZE_TOL_MS
-            if abs(event.xdata - self.win_end_ms) <= tol:
-                self._resize_active = True
+            near_right = abs(event.xdata - self.win_end_ms)   <= tol
+            near_left  = abs(event.xdata - self.win_start_ms) <= tol
+            if near_right and near_left:
+                if near_right <= near_left:
+                    self._resize_right = True
+                else:
+                    self._resize_left  = True
+            elif near_right:
+                self._resize_right = True
+            elif near_left:
+                self._resize_left  = True
+            if self._resize_right or self._resize_left:
+                # snapshot full canvas at drag start so commit can restore outside-window content
+                self._resize_amp_snap   = self.rf_amp.copy()
+                self._resize_phase_snap = self.rf_phase.copy()
                 return
 
         # ── middle-click OR left-click in slide mode: shift the waveform ────────
@@ -843,20 +926,37 @@ class RFSimulator(QMainWindow):
                 self._schedule_sim()
 
     def _on_move(self, event):
-        # ── update cursor near right window edge ──────────────────────────────
-        if event.inaxes is self.ax_rf and event.xdata is not None and not self._slide_active and not self._zoom_active:
-            if abs(event.xdata - self.win_end_ms) <= self._RESIZE_TOL_MS:
+        # ── cursor feedback near window edges ────────────────────────────────
+        if (event.inaxes is self.ax_rf and event.xdata is not None
+                and not self._slide_active and not self._zoom_active
+                and not self._resize_left and not self._resize_right):
+            tol = self._RESIZE_TOL_MS
+            if (abs(event.xdata - self.win_end_ms)   <= tol or
+                    abs(event.xdata - self.win_start_ms) <= tol):
                 self.canvas.setCursor(Qt.SplitHCursor)
             elif self._draw_mode == 'slide':
                 self.canvas.setCursor(Qt.SizeHorCursor)
             else:
                 self.canvas.setCursor(Qt.CrossCursor)
 
-        # ── window resize drag ────────────────────────────────────────────────
-        if self._resize_active and event.xdata is not None:
-            new_end = max(self.canvas_dur_ms * 0.01, min(self.canvas_dur_ms, event.xdata))
+        # ── right edge resize drag ────────────────────────────────────────────
+        if self._resize_right and event.xdata is not None:
+            min_win = self.canvas_dur_ms * 0.005
+            new_end = np.clip(event.xdata,
+                              self.win_start_ms + min_win,
+                              self.canvas_dur_ms)
             self.win_end_ms = new_end
-            self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
+            self._update_window_overlay()
+            self._schedule_sim()
+            return
+
+        # ── left edge resize drag ─────────────────────────────────────────────
+        if self._resize_left and event.xdata is not None:
+            min_win = self.canvas_dur_ms * 0.005
+            new_start = np.clip(event.xdata,
+                                0.0,
+                                self.win_end_ms - min_win)
+            self.win_start_ms = new_start
             self._update_window_overlay()
             self._schedule_sim()
             return
@@ -923,10 +1023,16 @@ class RFSimulator(QMainWindow):
             self._zoom_active = False
             self._zoom_ax     = None
         if event.button in (1, 2):
-            self._slide_active  = False
-            self._resize_active = False
-            self._slide_amp_snap   = None
-            self._slide_phase_snap = None
+            was_resize = self._resize_left or self._resize_right
+            self._slide_active       = False
+            self._resize_left        = False
+            self._resize_right       = False
+            self._slide_amp_snap     = None
+            self._slide_phase_snap   = None
+            if was_resize:
+                self._commit_window_resize()
+                self._resize_amp_snap   = None
+                self._resize_phase_snap = None
         if event.button == 1:
             self._drawing = False
             self._last_ix = -1
@@ -985,18 +1091,20 @@ class RFSimulator(QMainWindow):
             for ln in self._fwhm_lines: ln.set_visible(False)
 
     def _update_window_overlay(self):
-        """Redraw overlay. Left edge fixed at 0, right edge = win_end_ms."""
+        """Redraw overlay. Both edges draggable."""
+        ws, we = self.win_start_ms, self.win_end_ms
         self._win_span.remove()
         self._win_span = self.ax_rf.axvspan(
-            0, self.win_end_ms, alpha=0.12, color="#ffa657", zorder=0
+            ws, we, alpha=0.12, color="#ffa657", zorder=0
         )
-        self._win_right.set_xdata([self.win_end_ms, self.win_end_ms])
-        eff_dt_us = self.win_end_ms * 1e3 / self.N   # µs per sample
+        self._win_left.set_xdata([ws, ws])
+        self._win_right.set_xdata([we, we])
+        win_dur = we - ws
+        eff_dt_us = win_dur * 1e3 / self.N
+        self._win_label.set_x(ws + win_dur * 0.02)
         self._win_label.set_text(
-            f"window: 0 – {self.win_end_ms:.2f} ms"
-            f"  |  scaled to rf_dur={self.rf_dur_ms:.2f} ms"
-            f"  |  eff. dt={eff_dt_us:.2f} µs/sample"
-            f"  |  drag right edge ↔ to resize"
+            f"window: {ws:.2f} – {we:.2f} ms  (selects shape region)"
+            f"  |  sim duration = rf_dur = {self.rf_dur_ms:.2f} ms  (fixed)"
         )
         self.canvas.draw_idle()
 
@@ -1014,13 +1122,26 @@ class RFSimulator(QMainWindow):
         self._update_window_overlay()
 
     def _run_sim(self):
-        eff_dur_s = self.win_end_ms * 1e-3
-        dt_s      = eff_dur_s / self.N
+        # The window selects WHICH samples to feed into the sim (shape selector).
+        # The RF duration typed by the user is ALWAYS the time those N samples
+        # play out over — dt is fixed to rf_dur_ms regardless of window width.
+        #
+        #   dt = rf_dur_ms / N   ← always, invariant
+        #
+        # Window width only affects which part of the drawn canvas is sampled.
+        # Narrow window = zoom into a short region of the drawing and play it
+        # over the full rf_dur_ms. Wide window = use more of the drawing.
+        # Either way the Bloch sim sees exactly rf_dur_ms worth of pulse.
 
-        # Extract N resampled samples from the window (normalised shape, −1..1)
-        idx       = self._window_indices()
-        shape_w   = self.rf_amp[idx].astype(np.float64)     # normalised shape
-        rf_phs_w  = self.rf_phase[idx].astype(np.float64)
+        dur_s = self.rf_dur_ms * 1e-3     # always the typed RF duration
+        dt_s  = dur_s / self.N             # fixed dwell time
+
+        win_dur_ms = max(0.001, self.win_end_ms - self.win_start_ms)
+
+        # Extract N resampled samples from the window region
+        idx      = self._window_indices()
+        shape_w  = self.rf_amp[idx].astype(np.float64)
+        rf_phs_w = self.rf_phase[idx].astype(np.float64)
 
         # Compute B1 peak from the desired flip angle and pulse shape integral:
         #   flip_rad = γ · B1_peak · ∫|shape(t)| dt
@@ -1065,10 +1186,10 @@ class RFSimulator(QMainWindow):
         self.ax_ph.set_ylim(-np.pi - 0.2, np.pi + 0.2)
 
         self._draw_fwhm(x_mm, mxy_mag)
-        self._update_status(x_mm, mxy_mag, Mz, rf_rad, eff_dur_s, g_t_per_m, b1_peak_uT)
+        self._update_status(x_mm, mxy_mag, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT, win_dur_ms)
         self.canvas.draw_idle()
 
-    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT):
+    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT, win_dur_ms):
         peak     = mxy.max()
         flip_eff = np.rad2deg(np.arcsin(np.clip(peak, 0, 1)))
         sum_flip = np.rad2deg(rf_rad.sum())
@@ -1077,8 +1198,6 @@ class RFSimulator(QMainWindow):
         fwhm = (x_mm[idx[-1]] - x_mm[idx[0]]) if len(idx) >= 2 else 0.0
 
         g_mt_per_m = g_t_per_m * 1e3
-
-        # update toolbar computed labels
         self.lbl_grad_computed.setText(f"{g_mt_per_m:.2f}")
         self.lbl_b1_computed.setText(f"{b1_peak_uT:.2f}")
 
@@ -1089,7 +1208,8 @@ class RFSimulator(QMainWindow):
             f"   |   Peak |Mxy|: {peak:.3f}"
             f"   |   Eff. flip: {flip_eff:.1f}°"
             f"   |   FWHM: {fwhm:.2f} mm  (target: {self.slice_mm:.1f} mm)"
-            f"   |   Window: {self.win_end_ms:.2f} ms  (nominal: {self.rf_dur_ms:.2f} ms)"
+            f"   |   RF sim duration: {self.rf_dur_ms:.2f} ms  [= input]"
+            f"   |   Window: {self.win_start_ms:.2f}–{self.win_end_ms:.2f} ms  (shape selector)"
             f"   |   Mz(centre): {Mz[len(Mz)//2]:.3f}"
         )
 
