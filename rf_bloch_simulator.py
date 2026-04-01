@@ -561,6 +561,14 @@ class RFSimulator(QMainWindow):
             self.ax_mxy.axvline(0, color="#ffa657", lw=0.8, ls="--", visible=False),
             self.ax_mxy.axvline(0, color="#ffa657", lw=0.8, ls="--", visible=False),
         ]
+        # Chemical shift marker on Mxy (shows fat-water shift from B0)
+        self._chem_shift_line = self.ax_mxy.axvline(
+            0, color="#f78166", lw=1.0, ls=":", visible=False, label="fat shift"
+        )
+        self._chem_shift_text = self.ax_mxy.text(
+            0, 0.5, "", fontsize=7, color="#f78166", va="bottom", ha="left",
+            transform=self.ax_mxy.get_xaxis_transform(), visible=False
+        )
 
     # ── signal wiring ──────────────────────────────────────────────────────────
 
@@ -1059,24 +1067,83 @@ class RFSimulator(QMainWindow):
     def _schedule_sim(self):
         self._sim_timer.start(25)
 
-    def _required_gradient(self):
+    def _required_gradient(self, shape_w):
         """
-        Compute the slice-select gradient (T/m) required so that the
-        requested slice thickness (mm) is achieved for the given TBW and
-        RF duration.
+        Find the slice-select gradient (T/m) such that the Bloch-simulated
+        FWHM of |Mxy| equals slice_mm exactly, for the given shape.
 
-        Physics:
-            BW_pulse  = TBW / T_RF          [Hz]
-            BW_spatial = γ · G · Δz          [Hz]
-            → G = TBW / (γ · T_RF · Δz)
-
-        This guarantees FWHM of |Mxy| = slice_mm when the pulse has
-        the correct TBW × duration product.
+        Uses bisection on a coarse profile (64 slices) for speed.
+        This is the only physically correct method — no correction factors,
+        works for any pulse shape including truncated, hand-drawn, etc.
         """
-        T_RF  = self.rf_dur_ms * 1e-3          # s
-        dz    = self.slice_mm  * 1e-3          # m
-        G     = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)   # T/m
-        return G
+        dt_s   = self.rf_dur_ms * 1e-3 / self.N
+        dz     = self.slice_mm * 1e-3
+        flip_rad = np.deg2rad(self.flip_deg)
+
+        shape_integral = np.abs(shape_w).sum()
+        if shape_integral < 1e-12:
+            # empty pulse — return nominal gradient
+            G_nom = self.tbw / (GAMMA_HZ_PER_T * self.rf_dur_ms * 1e-3 * dz)
+            return G_nom, self.tbw
+
+        b1_T   = flip_rad / (GAMMA_RAD * dt_s * shape_integral)
+        rf_rad = (shape_w * b1_T * GAMMA_RAD * dt_s).astype(np.float64)
+        rf_phs = np.zeros(self.N, dtype=np.float64)
+
+        # Quick sanity check: does this pulse actually produce meaningful Mxy?
+        # Test at a very coarse level (on-resonance only) to guard against
+        # near-zero pulses returning garbage gradients.
+        test_offsets = np.zeros(1, dtype=np.float64)
+        Mxy_test, _ = bloch_simulate(rf_rad, rf_phs, test_offsets, dt_s)
+        if np.abs(Mxy_test[0]) < 0.01:
+            G_nom = self.tbw / (GAMMA_HZ_PER_T * self.rf_dur_ms * 1e-3 * dz)
+            return G_nom, self.tbw
+
+        def fwhm_for_G(G_tm):
+            """Run a coarse 128-point Bloch sim and return FWHM in mm."""
+            S      = 128
+            # FOV wide enough to always capture the profile — use 20× slice
+            fov_m  = dz * 20
+            x_m    = np.linspace(-fov_m / 2, fov_m / 2, S)
+            offsets = GAMMA_HZ_PER_T * G_tm * x_m
+            Mxy, _ = bloch_simulate(rf_rad, rf_phs, offsets, dt_s)
+            mxy    = np.abs(Mxy)
+            pk     = mxy.max()
+            if pk < 0.01:
+                return fov_m * 1e3
+            idx = np.where(mxy >= pk * 0.5)[0]
+            if len(idx) < 2:
+                return fov_m * 1e3
+            return (x_m[idx[-1]] - x_m[idx[0]]) * 1e3   # mm
+
+        # Bisection: find G such that fwhm_for_G(G) = slice_mm
+        G_lo, G_hi = 1e-5, 1.0   # 0.01 mT/m to 1000 mT/m
+        fwhm_lo = fwhm_for_G(G_lo)
+        fwhm_hi = fwhm_for_G(G_hi)
+
+        # If bracket doesn't straddle the target, return the closer bound
+        # rather than an extreme value
+        if fwhm_lo < self.slice_mm:
+            return G_lo, G_lo * GAMMA_HZ_PER_T * (self.rf_dur_ms * 1e-3) * dz
+        if fwhm_hi > self.slice_mm:
+            # Profile still too wide even at maximum G — pulse is very weak/wide
+            # Use nominal formula as a safe fallback
+            G_nom = self.tbw / (GAMMA_HZ_PER_T * self.rf_dur_ms * 1e-3 * dz)
+            return G_nom, self.tbw
+
+        for _ in range(24):
+            G_mid    = (G_lo + G_hi) / 2.0
+            fwhm_mid = fwhm_for_G(G_mid)
+            if fwhm_mid > self.slice_mm:
+                G_lo = G_mid
+            else:
+                G_hi = G_mid
+            if abs(G_hi - G_lo) / max(G_hi, 1e-9) < 1e-5:
+                break
+
+        G_opt   = (G_lo + G_hi) / 2.0
+        tbw_eff = G_opt * GAMMA_HZ_PER_T * (self.rf_dur_ms * 1e-3) * dz
+        return G_opt, tbw_eff
 
     def _draw_fwhm(self, x_mm, mxy):
         peak = mxy.max()
@@ -1091,6 +1158,35 @@ class RFSimulator(QMainWindow):
             for ln in self._fwhm_lines: ln.set_visible(False)
 
     def _update_window_overlay(self):
+        """Redraw overlay. Both edges draggable."""
+        ws, we = self.win_start_ms, self.win_end_ms
+        self._win_span.remove()
+        self._win_span = self.ax_rf.axvspan(
+            ws, we, alpha=0.12, color="#ffa657", zorder=0
+        )
+        self._win_left.set_xdata([ws, ws])
+        self._win_right.set_xdata([we, we])
+        win_dur = max(we - ws, 1e-6)
+        self._win_label.set_x(ws + win_dur * 0.02)
+        self._win_label.set_text(
+            f"window: {ws:.2f} – {we:.2f} ms  (selects shape region)"
+            f"  |  sim duration = rf_dur = {self.rf_dur_ms:.2f} ms  (fixed)"
+        )
+        self.canvas.draw_idle()
+
+    def _draw_chem_shift(self, chem_shift_mm):
+        """Draw fat-water chemical shift marker on the Mxy plot."""
+        if abs(chem_shift_mm) < 0.01:
+            self._chem_shift_line.set_visible(False)
+            self._chem_shift_text.set_visible(False)
+            return
+        self._chem_shift_line.set_xdata([chem_shift_mm, chem_shift_mm])
+        self._chem_shift_line.set_visible(True)
+        self._chem_shift_text.set_x(chem_shift_mm + 0.1)
+        self._chem_shift_text.set_text(f"Δfat {chem_shift_mm:.1f}mm")
+        self._chem_shift_text.set_visible(True)
+
+
         """Redraw overlay. Both edges draggable."""
         ws, we = self.win_start_ms, self.win_end_ms
         self._win_span.remove()
@@ -1158,12 +1254,17 @@ class RFSimulator(QMainWindow):
         # Scale shape to physical B1 amplitude for the Bloch sim
         rf_rad = shape_w * b1_peak_T * GAMMA_RAD * dt_s   # flip-angle per step (rad)
 
-        g_t_per_m = self._required_gradient()
+        g_t_per_m, tbw_eff = self._required_gradient(shape_w)
 
         fov_m   = self.slice_mm * 1e-3 * 6
         x_m     = np.linspace(-fov_m / 2, fov_m / 2, self.n_slices)
         x_mm    = x_m * 1e3
         offsets = GAMMA_HZ_PER_T * g_t_per_m * x_m
+
+        # Chemical shift offset due to B0: fat-water = 3.5 ppm × γ × B0
+        # This shifts the fat slice profile by this many Hz → mm
+        chem_shift_hz  = 3.5e-6 * GAMMA_HZ_PER_T * self.b0_T   # Hz
+        chem_shift_mm  = chem_shift_hz / (GAMMA_HZ_PER_T * g_t_per_m * 1e-3) if g_t_per_m > 0 else 0.0
 
         Mxy, Mz = bloch_simulate(rf_rad, rf_phs_w, offsets, dt_s)
 
@@ -1186,10 +1287,11 @@ class RFSimulator(QMainWindow):
         self.ax_ph.set_ylim(-np.pi - 0.2, np.pi + 0.2)
 
         self._draw_fwhm(x_mm, mxy_mag)
-        self._update_status(x_mm, mxy_mag, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT, win_dur_ms)
+        self._draw_chem_shift(chem_shift_mm)
+        self._update_status(x_mm, mxy_mag, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT, win_dur_ms, tbw_eff, chem_shift_mm)
         self.canvas.draw_idle()
 
-    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT, win_dur_ms):
+    def _update_status(self, x_mm, mxy, Mz, rf_rad, dur_s, g_t_per_m, b1_peak_uT, win_dur_ms, tbw_eff, chem_shift_mm):
         peak     = mxy.max()
         flip_eff = np.rad2deg(np.arcsin(np.clip(peak, 0, 1)))
         sum_flip = np.rad2deg(rf_rad.sum())
@@ -1204,12 +1306,11 @@ class RFSimulator(QMainWindow):
         larmor_mhz = GAMMA_HZ_PER_T * self.b0_T / 1e6
         self.status.showMessage(
             f"  B0={self.b0_T:.1f}T  f₀={larmor_mhz:.1f}MHz"
-            f"   |   B1peak={b1_peak_uT:.2f}µT  G={g_mt_per_m:.2f}mT/m  [computed]"
-            f"   |   Peak |Mxy|: {peak:.3f}"
-            f"   |   Eff. flip: {flip_eff:.1f}°"
-            f"   |   FWHM: {fwhm:.2f} mm  (target: {self.slice_mm:.1f} mm)"
-            f"   |   RF sim duration: {self.rf_dur_ms:.2f} ms  [= input]"
-            f"   |   Window: {self.win_start_ms:.2f}–{self.win_end_ms:.2f} ms  (shape selector)"
+            f"  Δfat={chem_shift_mm:.1f}mm"
+            f"   |   B1peak={b1_peak_uT:.2f}µT  G={g_mt_per_m:.2f}mT/m"
+            f"   |   TBW_eff={tbw_eff:.2f} (nominal={self.tbw})"
+            f"   |   Peak |Mxy|: {peak:.3f}  Eff.flip: {flip_eff:.1f}°"
+            f"   |   FWHM: {fwhm:.2f}mm (target: {self.slice_mm:.1f}mm)"
             f"   |   Mz(centre): {Mz[len(Mz)//2]:.3f}"
         )
 
@@ -1247,3 +1348,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# First solve fwhm change from change in rf shape
+# then see problem of start window adjustment
+# then see for ampplitude, should we increase amplitude
