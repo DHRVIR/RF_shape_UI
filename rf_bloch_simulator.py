@@ -284,8 +284,10 @@ class RFSimulator(QMainWindow):
         self._resize_phase_snap  = None
         self._RESIZE_TOL_MS      = 0.0
 
-        # zoom state — one entry per axis, stores (xl, xr, yl, yu) at drag start
-        # and pixel position at drag start
+        # gradient calculation mode:
+        #   False → use TBW formula (fast, exact when preset/TBW controls shape)
+        #   True  → bisect from actual shape BW (when window crop or drawing changes shape)
+        self._grad_from_shape = False
         self._zoom_active  = False
         self._zoom_ax      = None
         self._zoom_start_px   = (0, 0)   # (x_px, y_px) when right-button pressed
@@ -659,6 +661,7 @@ class RFSimulator(QMainWindow):
         idx = self._window_indices()
         self.rf_amp[idx]   = amp_norm
         self.rf_phase[idx] = phase
+        self._grad_from_shape = False   # TBW slider defines the gradient
         self._update_rf_plot()
         self._schedule_sim()
 
@@ -841,6 +844,7 @@ class RFSimulator(QMainWindow):
         # Reset window to 0 → rf_dur_ms
         self.win_start_ms = 0.0
         self.win_end_ms   = self.rf_dur_ms
+        self._grad_from_shape = True   # shape changed by window → bisect BW
 
         # Redraw and recalculate everything
         self._update_rf_plot()
@@ -871,6 +875,7 @@ class RFSimulator(QMainWindow):
         if np.any(self.rf_phase != 0):
             self.rf_phase = savgol_filter(self.rf_phase, win, poly)
 
+        self._grad_from_shape = True   # shape changed by smoothing → bisect BW
         self._update_rf_plot()
         self._schedule_sim()
 
@@ -926,6 +931,7 @@ class RFSimulator(QMainWindow):
         # ── left-click on RF: draw amplitude or phase ─────────────────────────
         if event.button == 1 and event.inaxes is self.ax_rf and self._draw_mode != 'slide':
             self._drawing = True
+            self._grad_from_shape = True   # shape changed by drawing → bisect BW
             ix, fy = self._event_to_ix(event)
             if ix is not None:
                 self._last_ix = ix
@@ -1069,66 +1075,63 @@ class RFSimulator(QMainWindow):
 
     def _required_gradient(self, shape_w):
         """
-        Find the slice-select gradient (T/m) such that the Bloch-simulated
-        FWHM of |Mxy| equals slice_mm exactly, for the given shape.
+        Two paths depending on _grad_from_shape:
 
-        Uses bisection on a coarse profile (64 slices) for speed.
-        This is the only physically correct method — no correction factors,
-        works for any pulse shape including truncated, hand-drawn, etc.
+        False (preset/TBW controls shape):
+            G = TBW / (γ · T_RF · Δz)  — fast, exact, deterministic
+
+        True (window crop or hand-drawing changed the shape):
+            Bisect G until Bloch-simulated FWHM = slice_mm exactly.
+            Back-calculate effective TBW from the found G.
         """
-        dt_s   = self.rf_dur_ms * 1e-3 / self.N
-        dz     = self.slice_mm * 1e-3
-        flip_rad = np.deg2rad(self.flip_deg)
+        dt_s     = self.rf_dur_ms * 1e-3 / self.N
+        dz       = self.slice_mm * 1e-3
+        T_RF     = self.rf_dur_ms * 1e-3
 
         shape_integral = np.abs(shape_w).sum()
-        if shape_integral < 1e-12:
-            # empty pulse — return nominal gradient
-            G_nom = self.tbw / (GAMMA_HZ_PER_T * self.rf_dur_ms * 1e-3 * dz)
-            return G_nom, self.tbw
 
-        b1_T   = flip_rad / (GAMMA_RAD * dt_s * shape_integral)
-        rf_rad = (shape_w * b1_T * GAMMA_RAD * dt_s).astype(np.float64)
-        rf_phs = np.zeros(self.N, dtype=np.float64)
+        # ── Path 1: TBW-formula (fast) ────────────────────────────────────────
+        if not self._grad_from_shape or shape_integral < 1e-12:
+            G   = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
+            return G, self.tbw
 
-        # Quick sanity check: does this pulse actually produce meaningful Mxy?
-        # Test at a very coarse level (on-resonance only) to guard against
-        # near-zero pulses returning garbage gradients.
-        test_offsets = np.zeros(1, dtype=np.float64)
-        Mxy_test, _ = bloch_simulate(rf_rad, rf_phs, test_offsets, dt_s)
+        # ── Path 2: bisect from actual shape ──────────────────────────────────
+        flip_rad = np.deg2rad(self.flip_deg)
+        b1_T     = flip_rad / (GAMMA_RAD * dt_s * shape_integral)
+        rf_rad   = (shape_w * b1_T * GAMMA_RAD * dt_s).astype(np.float64)
+        rf_phs   = np.zeros(self.N, dtype=np.float64)
+
+        # Quick sanity: pulse must produce meaningful Mxy on-resonance
+        test_off = np.zeros(1, dtype=np.float64)
+        Mxy_test, _ = bloch_simulate(rf_rad, rf_phs, test_off, dt_s)
         if np.abs(Mxy_test[0]) < 0.01:
-            G_nom = self.tbw / (GAMMA_HZ_PER_T * self.rf_dur_ms * 1e-3 * dz)
-            return G_nom, self.tbw
+            G = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
+            return G, self.tbw
 
         def fwhm_for_G(G_tm):
-            """Run a coarse 128-point Bloch sim and return FWHM in mm."""
-            S      = 128
-            # FOV wide enough to always capture the profile — use 20× slice
-            fov_m  = dz * 20
-            x_m    = np.linspace(-fov_m / 2, fov_m / 2, S)
+            S       = 128
+            fov_m   = dz * 20
+            x_m     = np.linspace(-fov_m / 2, fov_m / 2, S)
             offsets = GAMMA_HZ_PER_T * G_tm * x_m
-            Mxy, _ = bloch_simulate(rf_rad, rf_phs, offsets, dt_s)
-            mxy    = np.abs(Mxy)
-            pk     = mxy.max()
+            Mxy, _  = bloch_simulate(rf_rad, rf_phs, offsets, dt_s)
+            mxy     = np.abs(Mxy)
+            pk      = mxy.max()
             if pk < 0.01:
                 return fov_m * 1e3
             idx = np.where(mxy >= pk * 0.5)[0]
             if len(idx) < 2:
                 return fov_m * 1e3
-            return (x_m[idx[-1]] - x_m[idx[0]]) * 1e3   # mm
+            return (x_m[idx[-1]] - x_m[idx[0]]) * 1e3
 
-        # Bisection: find G such that fwhm_for_G(G) = slice_mm
-        G_lo, G_hi = 1e-5, 1.0   # 0.01 mT/m to 1000 mT/m
+        G_lo, G_hi   = 1e-5, 1.0
         fwhm_lo = fwhm_for_G(G_lo)
         fwhm_hi = fwhm_for_G(G_hi)
 
-        # If bracket doesn't straddle the target, return the closer bound
-        # rather than an extreme value
         if fwhm_lo < self.slice_mm:
-            return G_lo, G_lo * GAMMA_HZ_PER_T * (self.rf_dur_ms * 1e-3) * dz
+            tbw_eff = G_lo * GAMMA_HZ_PER_T * T_RF * dz
+            return G_lo, tbw_eff
         if fwhm_hi > self.slice_mm:
-            # Profile still too wide even at maximum G — pulse is very weak/wide
-            # Use nominal formula as a safe fallback
-            G_nom = self.tbw / (GAMMA_HZ_PER_T * self.rf_dur_ms * 1e-3 * dz)
+            G_nom = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
             return G_nom, self.tbw
 
         for _ in range(24):
@@ -1142,7 +1145,7 @@ class RFSimulator(QMainWindow):
                 break
 
         G_opt   = (G_lo + G_hi) / 2.0
-        tbw_eff = G_opt * GAMMA_HZ_PER_T * (self.rf_dur_ms * 1e-3) * dz
+        tbw_eff = G_opt * GAMMA_HZ_PER_T * T_RF * dz
         return G_opt, tbw_eff
 
     def _draw_fwhm(self, x_mm, mxy):
@@ -1303,12 +1306,19 @@ class RFSimulator(QMainWindow):
         self.lbl_grad_computed.setText(f"{g_mt_per_m:.2f}")
         self.lbl_b1_computed.setText(f"{b1_peak_uT:.2f}")
 
+        # If gradient was computed from shape (not TBW formula), update the
+        # TBW slider label to show the effective TBW back-calculated from shape
+        if self._grad_from_shape:
+            tbw_display = f"{tbw_eff:.1f} (from shape)"
+        else:
+            tbw_display = f"{self.tbw} (from slider)"
+
         larmor_mhz = GAMMA_HZ_PER_T * self.b0_T / 1e6
         self.status.showMessage(
             f"  B0={self.b0_T:.1f}T  f₀={larmor_mhz:.1f}MHz"
             f"  Δfat={chem_shift_mm:.1f}mm"
             f"   |   B1peak={b1_peak_uT:.2f}µT  G={g_mt_per_m:.2f}mT/m"
-            f"   |   TBW_eff={tbw_eff:.2f} (nominal={self.tbw})"
+            f"   |   TBW={tbw_display}"
             f"   |   Peak |Mxy|: {peak:.3f}  Eff.flip: {flip_eff:.1f}°"
             f"   |   FWHM: {fwhm:.2f}mm (target: {self.slice_mm:.1f}mm)"
             f"   |   Mz(centre): {Mz[len(Mz)//2]:.3f}"
