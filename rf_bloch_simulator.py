@@ -287,7 +287,8 @@ class RFSimulator(QMainWindow):
         # gradient calculation mode:
         #   False → use TBW formula (fast, exact when preset/TBW controls shape)
         #   True  → bisect from actual shape BW (when window crop or drawing changes shape)
-        self._grad_from_shape = False
+        self._grad_from_shape    = False
+        self._canvas_x_offset_ms = 0.0   # negative when left-cut content exists in neg time
         self._zoom_active  = False
         self._zoom_ax      = None
         self._zoom_start_px   = (0, 0)   # (x_px, y_px) when right-button pressed
@@ -661,7 +662,8 @@ class RFSimulator(QMainWindow):
         idx = self._window_indices()
         self.rf_amp[idx]   = amp_norm
         self.rf_phase[idx] = phase
-        self._grad_from_shape = False   # TBW slider defines the gradient
+        self._grad_from_shape    = False
+        self._canvas_x_offset_ms = 0.0
         self._update_rf_plot()
         self._schedule_sim()
 
@@ -678,11 +680,11 @@ class RFSimulator(QMainWindow):
 
     def _on_clear(self):
         """Clear entire canvas and reset window to default (rf_dur_ms)."""
-        self.rf_amp[:]   = 0.0
-        self.rf_phase[:] = 0.0
-        # reset window right edge back to nominal rf duration
-        self.win_start_ms   = 0.0
-        self.win_end_ms     = self.rf_dur_ms
+        self.rf_amp[:]           = 0.0
+        self.rf_phase[:]         = 0.0
+        self.win_start_ms        = 0.0
+        self.win_end_ms          = self.rf_dur_ms
+        self._canvas_x_offset_ms = 0.0
         self._update_window_overlay()
         self._schedule_sim()
         self._update_rf_plot()
@@ -693,8 +695,9 @@ class RFSimulator(QMainWindow):
         return (self.ax_mxy, self.ax_mz, self.ax_ph)
 
     def _reset_zoom_rf(self):
-        """Snap RF x-axis back to full canvas width, y to data extent."""
-        self.ax_rf.set_xlim(0, self.canvas_dur_ms)
+        """Reset RF zoom to show full canvas including any negative-time content."""
+        x0 = self._canvas_x_offset_ms
+        self.ax_rf.set_xlim(min(x0, 0), self.canvas_dur_ms)
         amax = max(np.abs(self.rf_amp).max(), 0.5)
         pmax = max(np.abs(self.rf_phase).max(), 0.2)
         top  = max(amax, pmax) * 1.15
@@ -787,85 +790,56 @@ class RFSimulator(QMainWindow):
 
     def _commit_window_resize(self):
         """
-        On window-edge release — build new canvas in three sections:
+        On window-edge release — rescale entire canvas so:
+          - new_t=0      corresponds to orig_t = win_start_ms  (window left)
+          - new_t=rf_dur corresponds to orig_t = win_end_ms    (window right)
+          - new_t < 0    corresponds to orig_t < win_start_ms  (left-cut, hidden)
+          - new_t > rf_dur corresponds to orig_t > win_end_ms  (right-cut, visible)
 
-          [0 ──── rf_dur_ms] [rf_dur_ms ──── ...] [... ──── canvas_dur_ms]
-            scaled window       right-cut content    left-cut content
-            (active, sim uses)  (proportionally       (was before win_start,
-                                 scaled, visible)      now appended at end)
-
-        All three sections scale proportionally so the whole pulse stays
-        consistent. Left-cut content is placed at the far right so it
-        remains visible for reference.
-
-        Scale = rf_dur_ms / win_dur_ms
+        The canvas array stores new_t from t_left to t_left+canvas_dur_ms
+        where t_left = -win_start_ms * scale  (negative when left was cut).
+        The x-offset is stored so _update_rf_plot labels the axis correctly.
+        Zooming left reveals the hidden left-cut content.
         """
         snap_amp   = self._resize_amp_snap
         snap_phase = self._resize_phase_snap
         if snap_amp is None:
-            self.win_start_ms = 0.0
-            self.win_end_ms   = self.rf_dur_ms
+            self.win_start_ms        = 0.0
+            self.win_end_ms          = self.rf_dur_ms
+            self._canvas_x_offset_ms = 0.0
             self._update_rf_plot()
             self._schedule_sim()
             return
 
         win_dur_ms = max(0.001, self.win_end_ms - self.win_start_ms)
-        scale      = self.rf_dur_ms / win_dur_ms   # stretch/compress factor
+        scale      = self.rf_dur_ms / win_dur_ms
 
-        # Number of canvas samples for each section (proportional to duration)
-        # Section 1: window content → always exactly N samples (= rf_dur_ms)
-        n1 = self.N
+        # New time axis: starts at t_left (negative if left was cut)
+        t_left  = -self.win_start_ms * scale
+        t_right =  t_left + self.canvas_dur_ms
 
-        # Section 2: right-cut content (from win_end_ms to canvas_dur_ms)
-        right_dur_ms = self.canvas_dur_ms - self.win_end_ms
-        right_dur_ms = max(0.0, right_dur_ms)
+        new_t_ms  = np.linspace(t_left, t_right, self._canvas_N)
+        # Each new_t sample came from orig_t = win_start + new_t / scale
+        orig_t_ms = self.win_start_ms + new_t_ms / scale
 
-        # Section 3: left-cut content (from 0 to win_start_ms)
-        left_dur_ms  = self.win_start_ms
-        left_dur_ms  = max(0.0, left_dur_ms)
+        # Map original time → snapshot index
+        orig_frac = orig_t_ms / self.canvas_dur_ms * (self._canvas_N - 1)
 
-        # Total remaining canvas after section 1
-        n_remaining = self._canvas_N - n1
+        # Mark samples whose orig_t is outside the snapshot bounds → zero
+        in_bounds = (orig_frac >= 0) & (orig_frac <= self._canvas_N - 1)
+        orig_frac_clamped = np.clip(orig_frac, 0, self._canvas_N - 1)
 
-        # Distribute remaining samples proportionally between left and right
-        total_outside = right_dur_ms + left_dur_ms
-        if total_outside > 1e-9:
-            n2 = int(round(n_remaining * right_dur_ms / total_outside))
-            n3 = n_remaining - n2
-        else:
-            n2 = n_remaining
-            n3 = 0
-
-        new_amp   = np.zeros(self._canvas_N)
-        new_phase = np.zeros(self._canvas_N)
-
-        # ── Section 1: window content resampled to n1 points ──────────────────
-        i0_snap = self._ms_to_ix(self.win_start_ms)
-        i1_snap = max(i0_snap + 1, self._ms_to_ix(self.win_end_ms))
-        src_idx = np.round(np.linspace(i0_snap, i1_snap - 1, n1)).astype(int)
-        src_idx = np.clip(src_idx, 0, self._canvas_N - 1)
-        new_amp[:n1]   = snap_amp[src_idx]
-        new_phase[:n1] = snap_phase[src_idx]
-
-        # ── Section 2: right-cut content (win_end_ms → canvas_dur_ms) ─────────
-        if n2 > 0 and right_dur_ms > 1e-9:
-            i2_start = self._ms_to_ix(self.win_end_ms)
-            i2_end   = self._canvas_N
-            src2 = np.round(np.linspace(i2_start, i2_end - 1, n2)).astype(int)
-            src2 = np.clip(src2, 0, self._canvas_N - 1)
-            new_amp[n1:n1+n2]   = snap_amp[src2]
-            new_phase[n1:n1+n2] = snap_phase[src2]
-
-        # ── Section 3: left-cut content (0 → win_start_ms) ────────────────────
-        if n3 > 0 and left_dur_ms > 1e-9:
-            i3_end = self._ms_to_ix(self.win_start_ms)
-            src3 = np.round(np.linspace(0, i3_end - 1, n3)).astype(int)
-            src3 = np.clip(src3, 0, self._canvas_N - 1)
-            new_amp[n1+n2:n1+n2+n3]   = snap_amp[src3]
-            new_phase[n1+n2:n1+n2+n3] = snap_phase[src3]
+        new_amp   = np.interp(orig_frac_clamped, np.arange(self._canvas_N), snap_amp)
+        new_phase = np.interp(orig_frac_clamped, np.arange(self._canvas_N), snap_phase)
+        new_amp[~in_bounds]   = 0.0
+        new_phase[~in_bounds] = 0.0
 
         self.rf_amp   = new_amp
         self.rf_phase = new_phase
+
+        # Store x-offset so the plot labels time correctly
+        # canvas index 0 corresponds to t = t_left
+        self._canvas_x_offset_ms = t_left
 
         # Reset window to 0 → rf_dur_ms
         self.win_start_ms = 0.0
@@ -1233,10 +1207,14 @@ class RFSimulator(QMainWindow):
         self.canvas.draw_idle()
 
     def _update_rf_plot(self):
-        """Redraw the full canvas waveform and the window overlay."""
-        t_ms = np.linspace(0, self.canvas_dur_ms, self._canvas_N)
+        """Redraw the full canvas waveform and the window overlay.
+        When _canvas_x_offset_ms < 0, the x-axis starts there so left-cut
+        content is accessible by zooming out left."""
+        x0   = self._canvas_x_offset_ms
+        t_ms = np.linspace(x0, x0 + self.canvas_dur_ms, self._canvas_N)
         self.line_amp.set_data(t_ms, self.rf_amp)
         self.line_phs.set_data(t_ms, self.rf_phase)
+        # Default view: show from x0 to canvas_dur_ms (hides negative if offset=0)
         self.ax_rf.set_xlim(0, self.canvas_dur_ms)
         amax = max(np.abs(self.rf_amp).max(), 0.5)
         pmax = max(np.abs(self.rf_phase).max(), 0.2)
