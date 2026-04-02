@@ -787,20 +787,18 @@ class RFSimulator(QMainWindow):
 
     def _commit_window_resize(self):
         """
-        On window-edge release — rescale the ENTIRE canvas proportionally.
+        On window-edge release — build new canvas in three sections:
 
-        The window defines which region is "active", but the whole canvas
-        is resampled so that:
-          - The window region maps to [0 → rf_dur_ms] (first N positions)
-          - Everything outside the window is scaled by the same factor
-            and placed after rf_dur_ms on the canvas
+          [0 ──── rf_dur_ms] [rf_dur_ms ──── ...] [... ──── canvas_dur_ms]
+            scaled window       right-cut content    left-cut content
+            (active, sim uses)  (proportionally       (was before win_start,
+                                 scaled, visible)      now appended at end)
 
-        This keeps the whole pulse proportionally correct so subsequent
-        window adjustments always see a consistent, properly scaled canvas.
+        All three sections scale proportionally so the whole pulse stays
+        consistent. Left-cut content is placed at the far right so it
+        remains visible for reference.
 
-        Scale factor = rf_dur_ms / win_dur_ms
-          - Narrow window (crop) → factor > 1 → canvas content stretched
-          - Wide window (expand) → factor < 1 → canvas content compressed
+        Scale = rf_dur_ms / win_dur_ms
         """
         snap_amp   = self._resize_amp_snap
         snap_phase = self._resize_phase_snap
@@ -812,41 +810,68 @@ class RFSimulator(QMainWindow):
             return
 
         win_dur_ms = max(0.001, self.win_end_ms - self.win_start_ms)
+        scale      = self.rf_dur_ms / win_dur_ms   # stretch/compress factor
 
-        # Scale factor: how much does the canvas content need to stretch/compress
-        # so that the selected window fills rf_dur_ms exactly.
-        scale = self.rf_dur_ms / win_dur_ms   # >1 = stretch, <1 = compress
+        # Number of canvas samples for each section (proportional to duration)
+        # Section 1: window content → always exactly N samples (= rf_dur_ms)
+        n1 = self.N
 
-        # The new canvas represents: original_canvas_dur * scale in time
-        # We resample the entire snapshot into canvas_N points, but shifted
-        # so that win_start_ms maps to t=0.
+        # Section 2: right-cut content (from win_end_ms to canvas_dur_ms)
+        right_dur_ms = self.canvas_dur_ms - self.win_end_ms
+        right_dur_ms = max(0.0, right_dur_ms)
 
-        # Original canvas time axis (ms):  0 → canvas_dur_ms
-        # After scaling, win_start → 0, and everything shifts and scales.
-        # New time axis: (orig_t - win_start_ms) * scale → fills canvas
+        # Section 3: left-cut content (from 0 to win_start_ms)
+        left_dur_ms  = self.win_start_ms
+        left_dur_ms  = max(0.0, left_dur_ms)
 
-        # Resample: for each new canvas position i, find the original position
-        #   orig_t = win_start_ms + new_t / scale
-        # where new_t goes from 0 → canvas_dur_ms
+        # Total remaining canvas after section 1
+        n_remaining = self._canvas_N - n1
 
-        new_t_ms  = np.linspace(0, self.canvas_dur_ms, self._canvas_N)
-        orig_t_ms = self.win_start_ms + new_t_ms / scale   # map back to snapshot
+        # Distribute remaining samples proportionally between left and right
+        total_outside = right_dur_ms + left_dur_ms
+        if total_outside > 1e-9:
+            n2 = int(round(n_remaining * right_dur_ms / total_outside))
+            n3 = n_remaining - n2
+        else:
+            n2 = n_remaining
+            n3 = 0
 
-        # Convert original time to fractional index in snapshot
-        orig_frac = orig_t_ms / self.canvas_dur_ms * (self._canvas_N - 1)
-        orig_frac = np.clip(orig_frac, 0, self._canvas_N - 1)
+        new_amp   = np.zeros(self._canvas_N)
+        new_phase = np.zeros(self._canvas_N)
 
-        self.rf_amp   = np.interp(orig_frac,
-                                  np.arange(self._canvas_N), snap_amp)
-        self.rf_phase = np.interp(orig_frac,
-                                  np.arange(self._canvas_N), snap_phase)
+        # ── Section 1: window content resampled to n1 points ──────────────────
+        i0_snap = self._ms_to_ix(self.win_start_ms)
+        i1_snap = max(i0_snap + 1, self._ms_to_ix(self.win_end_ms))
+        src_idx = np.round(np.linspace(i0_snap, i1_snap - 1, n1)).astype(int)
+        src_idx = np.clip(src_idx, 0, self._canvas_N - 1)
+        new_amp[:n1]   = snap_amp[src_idx]
+        new_phase[:n1] = snap_phase[src_idx]
+
+        # ── Section 2: right-cut content (win_end_ms → canvas_dur_ms) ─────────
+        if n2 > 0 and right_dur_ms > 1e-9:
+            i2_start = self._ms_to_ix(self.win_end_ms)
+            i2_end   = self._canvas_N
+            src2 = np.round(np.linspace(i2_start, i2_end - 1, n2)).astype(int)
+            src2 = np.clip(src2, 0, self._canvas_N - 1)
+            new_amp[n1:n1+n2]   = snap_amp[src2]
+            new_phase[n1:n1+n2] = snap_phase[src2]
+
+        # ── Section 3: left-cut content (0 → win_start_ms) ────────────────────
+        if n3 > 0 and left_dur_ms > 1e-9:
+            i3_end = self._ms_to_ix(self.win_start_ms)
+            src3 = np.round(np.linspace(0, i3_end - 1, n3)).astype(int)
+            src3 = np.clip(src3, 0, self._canvas_N - 1)
+            new_amp[n1+n2:n1+n2+n3]   = snap_amp[src3]
+            new_phase[n1+n2:n1+n2+n3] = snap_phase[src3]
+
+        self.rf_amp   = new_amp
+        self.rf_phase = new_phase
 
         # Reset window to 0 → rf_dur_ms
         self.win_start_ms = 0.0
         self.win_end_ms   = self.rf_dur_ms
-        self._grad_from_shape = True   # shape changed by window → bisect BW
+        self._grad_from_shape = True
 
-        # Redraw and recalculate everything
         self._update_rf_plot()
         self._schedule_sim()
 
