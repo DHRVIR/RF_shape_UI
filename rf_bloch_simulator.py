@@ -728,7 +728,17 @@ class RFSimulator(QMainWindow):
         return self.N * self.CANVAS_MULT
 
     def _ms_to_ix(self, t_ms):
-        return int(np.clip(t_ms / self.canvas_dur_ms * self._canvas_N, 0, self._canvas_N - 1))
+        """Convert canvas array time (0..canvas_dur_ms) to array index.
+        This is used for window position logic — always in raw array coords
+        (array index 0 = start of array, regardless of display offset)."""
+        frac = t_ms / self.canvas_dur_ms
+        return int(np.clip(frac * self._canvas_N, 0, self._canvas_N - 1))
+
+    def _display_ms_to_ix(self, t_ms_display):
+        """Convert a displayed time (which may be offset) to canvas array index.
+        Used for drawing strokes and event coords after a left-edge commit."""
+        frac = (t_ms_display - self._canvas_x_offset_ms) / self.canvas_dur_ms
+        return int(np.clip(frac * self._canvas_N, 0, self._canvas_N - 1))
 
     def _window_indices(self):
         """
@@ -743,15 +753,19 @@ class RFSimulator(QMainWindow):
     def _event_to_ix(self, event):
         if event.inaxes is not self.ax_rf:
             return None, None
-        xl, xr = self.ax_rf.get_xlim()
         yl, yu = self.ax_rf.get_ylim()
-        # map x from axis data coords → canvas sample index
-        frac = (event.xdata - 0.0) / self.canvas_dur_ms   # 0 to 1 across full canvas
-        ix   = int(np.clip(frac * self._canvas_N, 0, self._canvas_N - 1))
-        fy   = np.clip((event.ydata - yl) / (yu - yl), 0.0, 1.0)
+        # event.xdata is in display coords (may be offset) — use display converter
+        ix = self._display_ms_to_ix(event.xdata)
+        fy = np.clip((event.ydata - yl) / (yu - yl), 0.0, 1.0)
         return ix, fy
 
-    def _apply_stroke(self, ix, fy, last_ix):
+    def _to_display_ms(self, array_ms):
+        """Convert canvas array time to displayed axis time (adds offset)."""
+        return array_ms + self._canvas_x_offset_ms
+
+    def _to_array_ms(self, display_ms):
+        """Convert displayed axis time to canvas array time (subtracts offset)."""
+        return display_ms - self._canvas_x_offset_ms
         """
         Paint with a Gaussian brush instead of a hard pixel write.
         Brush radius comes from sl_brush (canvas samples).
@@ -901,10 +915,13 @@ class RFSimulator(QMainWindow):
         # ── left-click near window edge: resize left or right edge ──────────
         if event.button == 1 and event.inaxes is self.ax_rf and event.xdata is not None:
             tol = self._RESIZE_TOL_MS
-            near_right = abs(event.xdata - self.win_end_ms)   <= tol
-            near_left  = abs(event.xdata - self.win_start_ms) <= tol
+            # compare event.xdata (display) with window edges converted to display
+            win_start_disp = self._to_display_ms(self.win_start_ms)
+            win_end_disp   = self._to_display_ms(self.win_end_ms)
+            near_right = abs(event.xdata - win_end_disp)   <= tol
+            near_left  = abs(event.xdata - win_start_disp) <= tol
             if near_right and near_left:
-                if near_right <= near_left:
+                if abs(event.xdata - win_end_disp) <= abs(event.xdata - win_start_disp):
                     self._resize_right = True
                 else:
                     self._resize_left  = True
@@ -913,9 +930,9 @@ class RFSimulator(QMainWindow):
             elif near_left:
                 self._resize_left  = True
             if self._resize_right or self._resize_left:
-                # snapshot full canvas at drag start so commit can restore outside-window content
-                self._resize_amp_snap   = self.rf_amp.copy()
-                self._resize_phase_snap = self.rf_phase.copy()
+                self._resize_amp_snap    = self.rf_amp.copy()
+                self._resize_phase_snap  = self.rf_phase.copy()
+                self._grad_from_shape    = True
                 return
 
         # ── middle-click OR left-click in slide mode: shift the waveform ────────
@@ -944,8 +961,10 @@ class RFSimulator(QMainWindow):
                 and not self._slide_active and not self._zoom_active
                 and not self._resize_left and not self._resize_right):
             tol = self._RESIZE_TOL_MS
-            if (abs(event.xdata - self.win_end_ms)   <= tol or
-                    abs(event.xdata - self.win_start_ms) <= tol):
+            win_start_disp = self._to_display_ms(self.win_start_ms)
+            win_end_disp   = self._to_display_ms(self.win_end_ms)
+            if (abs(event.xdata - win_end_disp)   <= tol or
+                    abs(event.xdata - win_start_disp) <= tol):
                 self.canvas.setCursor(Qt.SplitHCursor)
             elif self._draw_mode == 'slide':
                 self.canvas.setCursor(Qt.SizeHorCursor)
@@ -954,10 +973,12 @@ class RFSimulator(QMainWindow):
 
         # ── right edge resize drag ────────────────────────────────────────────
         if self._resize_right and event.xdata is not None:
-            min_win = self.canvas_dur_ms * 0.005
-            new_end = np.clip(event.xdata,
-                              self.win_start_ms + min_win,
-                              self.canvas_dur_ms)
+            min_win   = self.canvas_dur_ms * 0.005
+            # event.xdata is display time → convert to array time
+            new_end   = self._to_array_ms(event.xdata)
+            new_end   = np.clip(new_end,
+                                self.win_start_ms + min_win,
+                                self.canvas_dur_ms)
             self.win_end_ms = new_end
             self._update_window_overlay()
             self._schedule_sim()
@@ -965,8 +986,9 @@ class RFSimulator(QMainWindow):
 
         # ── left edge resize drag ─────────────────────────────────────────────
         if self._resize_left and event.xdata is not None:
-            min_win = self.canvas_dur_ms * 0.005
-            new_start = np.clip(event.xdata,
+            min_win   = self.canvas_dur_ms * 0.005
+            new_start = self._to_array_ms(event.xdata)
+            new_start = np.clip(new_start,
                                 0.0,
                                 self.win_end_ms - min_win)
             self.win_start_ms = new_start
@@ -1160,19 +1182,20 @@ class RFSimulator(QMainWindow):
             for ln in self._fwhm_lines: ln.set_visible(False)
 
     def _update_window_overlay(self):
-        """Redraw overlay. Both edges draggable."""
-        ws, we = self.win_start_ms, self.win_end_ms
+        """Redraw overlay. Convert array times to display coords."""
+        ws = self._to_display_ms(self.win_start_ms)
+        we = self._to_display_ms(self.win_end_ms)
         self._win_span.remove()
         self._win_span = self.ax_rf.axvspan(
             ws, we, alpha=0.12, color="#ffa657", zorder=0
         )
         self._win_left.set_xdata([ws, ws])
         self._win_right.set_xdata([we, we])
-        win_dur = max(we - ws, 1e-6)
+        win_dur = max(self.win_end_ms - self.win_start_ms, 1e-6)
         self._win_label.set_x(ws + win_dur * 0.02)
         self._win_label.set_text(
-            f"window: {ws:.2f} – {we:.2f} ms  (selects shape region)"
-            f"  |  sim duration = rf_dur = {self.rf_dur_ms:.2f} ms  (fixed)"
+            f"window: {self.win_start_ms:.2f} – {self.win_end_ms:.2f} ms"
+            f"  |  sim duration = {self.rf_dur_ms:.2f} ms"
         )
         self.canvas.draw_idle()
 
@@ -1361,8 +1384,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# First solve fwhm change from change in rf shape
-# then see problem of start window adjustment
-# then see for ampplitude, should we increase amplitude
