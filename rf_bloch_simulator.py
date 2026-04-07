@@ -1397,5 +1397,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-#  bug is not solved yet (actual TBW should be different from slider value)
