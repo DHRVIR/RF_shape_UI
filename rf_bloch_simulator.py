@@ -1118,26 +1118,33 @@ class RFSimulator(QMainWindow):
 
         # ── Path 2: bisect from actual shape ──────────────────────────────────
         flip_rad = np.deg2rad(self.flip_deg)
-        b1_T     = flip_rad / (GAMMA_RAD * dt_s * shape_integral)
+        shape_sum_signed = shape_w.sum()
+        if abs(shape_sum_signed) > 1e-12:
+            b1_T = flip_rad / (GAMMA_RAD * dt_s * shape_sum_signed)
+        else:
+            b1_T = flip_rad / (GAMMA_RAD * dt_s * max(np.abs(shape_w).sum(), 1e-12))
         rf_rad   = (shape_w * b1_T * GAMMA_RAD * dt_s).astype(np.float64)
         rf_phs   = np.zeros(self.N, dtype=np.float64)
 
         # Quick sanity: pulse must produce meaningful Mxy on-resonance
         test_off = np.zeros(1, dtype=np.float64)
         Mxy_test, _ = bloch_simulate(rf_rad, rf_phs, test_off, dt_s)
-        if np.abs(Mxy_test[0]) < 0.01:
+        if np.clip(np.abs(Mxy_test[0]), 0, 1) < 0.01:
             G = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
             return G, self.tbw
 
         def fwhm_for_G(G_tm):
-            S       = 128
-            fov_m   = dz * 20
-            x_m     = np.linspace(-fov_m / 2, fov_m / 2, S)
+            # FOV = 6× expected slice at this G — adapts so slice is always captured
+            # Expected slice ≈ BW_pulse / (γ·G) where BW_pulse ≈ 1/T_RF
+            expected_slice_m = 1.0 / (GAMMA_HZ_PER_T * G_tm * T_RF)
+            fov_m = np.clip(expected_slice_m * 8, dz * 0.1, dz * 30)
+            S     = 256   # more points for better resolution
+            x_m   = np.linspace(-fov_m / 2, fov_m / 2, S)
             offsets = GAMMA_HZ_PER_T * G_tm * x_m
             Mxy, _  = bloch_simulate(rf_rad, rf_phs, offsets, dt_s)
-            mxy     = np.abs(Mxy)
+            mxy     = np.clip(np.abs(Mxy), 0, 1)
             pk      = mxy.max()
-            if pk < 0.01:
+            if pk < 0.005:
                 return fov_m * 1e3
             idx = np.where(mxy >= pk * 0.5)[0]
             if len(idx) < 2:
@@ -1268,17 +1275,23 @@ class RFSimulator(QMainWindow):
         shape_w  = self.rf_amp[idx].astype(np.float64)
         rf_phs_w = self.rf_phase[idx].astype(np.float64)
 
-        # Compute B1 peak from the desired flip angle and pulse shape integral:
-        #   flip_rad = γ · B1_peak · ∫|shape(t)| dt
-        #            = γ · B1_peak · dt · Σ|shape[i]|
-        #   → B1_peak (T) = flip_rad / (γ · dt · Σ|shape[i]|)
-        shape_integral = np.abs(shape_w).sum()
+        # B1 peak computation:
+        #   flip_rad = γ · B1_peak · ∫shape(t)·dt  (signed integral)
+        #            = γ · B1_peak · dt · Σshape[i]  (signed sum)
+        #   → B1_peak (T) = flip_rad / (γ · dt · Σshape[i])
+        #
+        # We use signed sum because negative lobes subtract from the flip angle.
+        # B1_peak displayed is |B1_peak| (peak amplitude of the waveform).
+        shape_sum_signed = shape_w.sum()
+        shape_integral   = np.abs(shape_w).sum()   # for B1 peak display
         flip_rad = np.deg2rad(self.flip_deg)
-        if shape_integral > 1e-12:
+        if abs(shape_sum_signed) > 1e-12:
+            b1_peak_T  = flip_rad / (GAMMA_RAD * dt_s * shape_sum_signed)
+        elif shape_integral > 1e-12:
             b1_peak_T  = flip_rad / (GAMMA_RAD * dt_s * shape_integral)
         else:
             b1_peak_T  = 0.0
-        b1_peak_uT = b1_peak_T * 1e6
+        b1_peak_uT = abs(b1_peak_T) * 1e6   # display as positive
 
         # Scale shape to physical B1 amplitude for the Bloch sim
         rf_rad = shape_w * b1_peak_T * GAMMA_RAD * dt_s   # flip-angle per step (rad)
@@ -1297,7 +1310,7 @@ class RFSimulator(QMainWindow):
 
         Mxy, Mz = bloch_simulate(rf_rad, rf_phs_w, offsets, dt_s)
 
-        mxy_mag = np.abs(Mxy)
+        mxy_mag = np.clip(np.abs(Mxy), 0, 1)
         mxy_phs = np.angle(Mxy)
 
         noise_floor    = max(mxy_mag.max() * 0.02, 0.01)
@@ -1384,3 +1397,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#  bug is not solved yet (actual TBW should be different from slider value)
