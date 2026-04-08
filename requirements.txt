@@ -1,0 +1,8 @@
+# RF Pulse Bloch Simulator — Python dependencies
+# Install with: pip install -r requirements.txt
+
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+PyQt5>=5.15.0
+numba>=0.57.0
