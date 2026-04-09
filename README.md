@@ -1,9 +1,12 @@
 # RF Pulse Bloch Simulator
 
+> 🚧 **Under Construction** — actively developed, expect changes and new features.
+
 An interactive desktop application for designing and simulating MRI RF pulse shapes with real-time Bloch equation simulation of slice profiles.
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Status](https://img.shields.io/badge/status-under%20construction-orange)
 
 ---
 
