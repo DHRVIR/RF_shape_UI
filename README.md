@@ -1,6 +1,6 @@
 # RF Pulse Bloch Simulator
 
-> 🚧 **Under Construction** — actively developed, expect changes and new features.
+> 🚧 **Under Construction** actively developed, expect changes and new features.
 
 An interactive desktop application for designing and simulating MRI RF pulse shapes with real-time Bloch equation simulation of slice profiles.
 
@@ -15,7 +15,7 @@ An interactive desktop application for designing and simulating MRI RF pulse sha
 - **Hand-draw RF pulses** directly on the canvas with a smooth Gaussian brush
 - **Real-time Bloch simulation** (hard-pulse approximation, no T1/T2) powered by Numba JIT + parallel CPU cores
 - **Live slice profiles**: |Mxy|, Mz, and Phase(Mxy) update as you draw
-- **Physically computed parameters**: B1 peak (µT) and slice-select gradient (mT/m) are derived from the pulse shape — never entered manually
+- **Physically computed parameters**: B1 peak (µT) and slice-select gradient (mT/m) are derived from the pulse shape never entered manually
 - **Window crop tool**: drag either edge of the active window to truncate the pulse; the canvas rescales automatically and TBW/gradient recompute from the new shape
 - **Shift pulse mode**: slide the entire waveform along the time axis without changing its shape
 - **B0 field selector** (1.5 T / 3.0 T / 7.0 T) with fat-water chemical shift marker
@@ -101,7 +101,7 @@ README.md                # This file
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License : see [LICENSE](LICENSE) for details.
 
 ---
 
