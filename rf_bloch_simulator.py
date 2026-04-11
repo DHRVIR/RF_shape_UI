@@ -282,7 +282,7 @@ class RFSimulator(QMainWindow):
         self._resize_right       = False
         self._resize_amp_snap    = None   # full canvas snapshot at drag start
         self._resize_phase_snap  = None
-        self._RESIZE_TOL_MS      = 0.0
+        self._RESIZE_TOL_PX      = 3   # pixels — snap zone width on screen
 
         # gradient calculation mode:
         #   False → use TBW formula (fast, exact when preset/TBW controls shape)
@@ -303,7 +303,6 @@ class RFSimulator(QMainWindow):
         self.canvas_dur_ms = self.rf_dur_ms * self.CANVAS_MULT
         self.win_start_ms   = 0.0
         self.win_end_ms     = self.rf_dur_ms
-        self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
 
         self._build_ui()
         self._connect_signals()
@@ -646,7 +645,6 @@ class RFSimulator(QMainWindow):
             self.canvas_dur_ms  = new_canvas
             self.win_start_ms   = 0.0
             self.win_end_ms     = self.rf_dur_ms
-            self._RESIZE_TOL_MS = self.canvas_dur_ms * 0.02
         self._update_rf_plot()
         self._schedule_sim()
 
@@ -726,6 +724,18 @@ class RFSimulator(QMainWindow):
     @property
     def _canvas_N(self):
         return self.N * self.CANVAS_MULT
+
+    def _resize_tol_ms(self):
+        """Convert fixed pixel snap-zone to data units using current axis width.
+        Always 6px on screen regardless of zoom or canvas size."""
+        ax = self.ax_rf
+        fig_w_px = self.canvas.get_width_height()[0]
+        ax_frac  = ax.get_position().width          # fraction of figure width
+        ax_w_px  = fig_w_px * ax_frac
+        xl, xr   = ax.get_xlim()
+        if ax_w_px < 1:
+            return 0.5
+        return self._RESIZE_TOL_PX / ax_w_px * (xr - xl)
 
     def _ms_to_ix(self, t_ms):
         """Convert canvas array time (0..canvas_dur_ms) to array index.
@@ -914,7 +924,7 @@ class RFSimulator(QMainWindow):
 
         # ── left-click near window edge: resize left or right edge ──────────
         if event.button == 1 and event.inaxes is self.ax_rf and event.xdata is not None:
-            tol = self._RESIZE_TOL_MS
+            tol = self._resize_tol_ms()
             # compare event.xdata (display) with window edges converted to display
             win_start_disp = self._to_display_ms(self.win_start_ms)
             win_end_disp   = self._to_display_ms(self.win_end_ms)
@@ -960,7 +970,7 @@ class RFSimulator(QMainWindow):
         if (event.inaxes is self.ax_rf and event.xdata is not None
                 and not self._slide_active and not self._zoom_active
                 and not self._resize_left and not self._resize_right):
-            tol = self._RESIZE_TOL_MS
+            tol = self._resize_tol_ms()
             win_start_disp = self._to_display_ms(self.win_start_ms)
             win_end_disp   = self._to_display_ms(self.win_end_ms)
             if (abs(event.xdata - win_end_disp)   <= tol or
