@@ -776,6 +776,8 @@ class RFSimulator(QMainWindow):
     def _to_array_ms(self, display_ms):
         """Convert displayed axis time to canvas array time (subtracts offset)."""
         return display_ms - self._canvas_x_offset_ms
+
+    def _apply_stroke(self, ix, fy, last_ix):
         """
         Paint with a Gaussian brush instead of a hard pixel write.
         Brush radius comes from sl_brush (canvas samples).
