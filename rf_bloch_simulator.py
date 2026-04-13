@@ -194,15 +194,19 @@ def preset_sinc_gauss(n, flip_deg, tbw):
 def preset_sinc_gauss_causal(n, flip_deg, tbw):
     """
     Asymmetric (minimum-phase / causal) sinc-Gauss:
-    The main lobe sits at the RIGHT end of the pulse.
-    The leading sidelobes (negative) ramp up from the left.
-    Achieved by mirroring the time axis of a standard sinc-gauss
-    so t=0 is at the far right (index n-1).
+    Sidelobes ramp up from the left, main lobe completes fully at the right.
+
+    The sinc main lobe always spans ±1 unit regardless of TBW.
+    So right_margin = 1.0 ensures the full right half of the main lobe
+    fits within the window for any TBW value.
+
+    t axis: -(tbw + 1) → +1
+    Peak at t=0, which lands at position tbw/(tbw+2) ≈ 80-90% into pulse.
     """
-    t     = np.linspace(-tbw, 0, n)          # t runs from -tbw → 0 (peak at right)
+    t     = np.linspace(-(tbw + 1.0), 1.0, n)
     sigma = tbw / 4.0
     gauss = np.exp(-t**2 / (2 * sigma**2))
-    env   = np.sinc(t) * gauss               # sinc(0)=1 at right end
+    env   = np.sinc(t) * gauss
     return _norm(env, flip_deg), np.zeros(n)
 
 def preset_gauss(n, flip_deg, tbw):
