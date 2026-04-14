@@ -193,20 +193,22 @@ def preset_sinc_gauss(n, flip_deg, tbw):
 
 def preset_sinc_gauss_causal(n, flip_deg, tbw):
     """
-    Asymmetric (minimum-phase / causal) sinc-Gauss:
-    Sidelobes ramp up from the left, main lobe completes fully at the right.
+    Asymmetric (causal) sinc pulse — main lobe on the far right, fully completed.
 
-    The sinc main lobe always spans ±1 unit regardless of TBW.
-    So right_margin = 1.0 ensures the full right half of the main lobe
-    fits within the window for any TBW value.
+    Lobe count = TBW:
+      TBW=1 → main lobe only
+      TBW=2 → 1 negative sidelobe + main lobe
+      TBW=3 → 1 negative + main  (2 lobes visible)
+      TBW=4 → 2 negative + main
+      TBW=N → (N-1) sidelobes + main lobe
 
-    t axis: -(tbw + 1) → +1
-    Peak at t=0, which lands at position tbw/(tbw+2) ≈ 80-90% into pulse.
+    t-axis: -(TBW-1) → +1
+    Each sinc lobe spans 1 unit. The main lobe (t=0→1) ends at sinc(1)=0.
+    The left edge starts at sinc(-(TBW-1)) which is also 0.
+    The pulse thus starts and ends at exactly zero with TBW lobes in between.
     """
-    t     = np.linspace(-(tbw + 1.0), 1.0, n)
-    sigma = tbw / 4.0
-    gauss = np.exp(-t**2 / (2 * sigma**2))
-    env   = np.sinc(t) * gauss
+    t   = np.linspace(-(tbw - 1.0), 1.0, n)
+    env = np.sinc(t)   # sinc(-(tbw-1))=0 and sinc(1)=0 exactly
     return _norm(env, flip_deg), np.zeros(n)
 
 def preset_gauss(n, flip_deg, tbw):
@@ -286,7 +288,7 @@ class RFSimulator(QMainWindow):
         self._resize_right       = False
         self._resize_amp_snap    = None   # full canvas snapshot at drag start
         self._resize_phase_snap  = None
-        self._RESIZE_TOL_PX      = 3   # pixels — snap zone width on screen
+        self._RESIZE_TOL_PX      = 6   # pixels — snap zone width on screen
 
         # gradient calculation mode:
         #   False → use TBW formula (fast, exact when preset/TBW controls shape)
@@ -657,14 +659,14 @@ class RFSimulator(QMainWindow):
     def _apply_preset(self, name):
         fn = PRESETS[name]
         amp_rad, phase = fn(self.N, self.flip_deg, self.tbw)
-        # Store waveform as normalised shape: peak absolute value = 1.0
-        # B1 peak is computed from this shape + flip angle + duration in _run_sim
         peak = np.abs(amp_rad).max()
         amp_norm = amp_rad / peak if peak > 1e-12 else np.zeros(self.N)
         idx = self._window_indices()
         self.rf_amp[idx]   = amp_norm
         self.rf_phase[idx] = phase
-        self._grad_from_shape    = False
+        # Causal sinc has different effective BW than nominal TBW formula assumes,
+        # so always use bisection for it. All other presets use the fast TBW formula.
+        self._grad_from_shape    = (name == "Sinc × Gauss (causal)")
         self._canvas_x_offset_ms = 0.0
         self._update_rf_plot()
         self._schedule_sim()
