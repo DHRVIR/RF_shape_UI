@@ -193,22 +193,20 @@ def preset_sinc_gauss(n, flip_deg, tbw):
 
 def preset_sinc_gauss_causal(n, flip_deg, tbw):
     """
-    Asymmetric (causal) sinc pulse — main lobe on the far right, fully completed.
+    Asymmetric (causal) sinc × Gauss — main lobe on the far right, fully completed.
 
-    Lobe count = TBW:
-      TBW=1 → main lobe only
-      TBW=2 → 1 negative sidelobe + main lobe
-      TBW=3 → 1 negative + main  (2 lobes visible)
-      TBW=4 → 2 negative + main
-      TBW=N → (N-1) sidelobes + main lobe
+    Same total span as symmetric sinc×gauss (tbw units), just time-reversed:
+      t: -(tbw-1) → +1   (starts and ends at sinc zero-crossings)
+      Gaussian sigma = tbw/4 (identical to symmetric version)
 
-    t-axis: -(TBW-1) → +1
-    Each sinc lobe spans 1 unit. The main lobe (t=0→1) ends at sinc(1)=0.
-    The left edge starts at sinc(-(TBW-1)) which is also 0.
-    The pulse thus starts and ends at exactly zero with TBW lobes in between.
+    The Gaussian is centred at t=0 (the main lobe peak) so it naturally
+    tapers the sidelobes on the left — exactly like the symmetric version
+    tapers both sides.
     """
-    t   = np.linspace(-(tbw - 1.0), 1.0, n)
-    env = np.sinc(t)   # sinc(-(tbw-1))=0 and sinc(1)=0 exactly
+    t     = np.linspace(-(tbw - 1.0), 1.0, n)
+    sigma = tbw / 4.0
+    gauss = np.exp(-t**2 / (2 * sigma**2))
+    env   = np.sinc(t) * gauss
     return _norm(env, flip_deg), np.zeros(n)
 
 def preset_gauss(n, flip_deg, tbw):
