@@ -1130,7 +1130,7 @@ class RFSimulator(QMainWindow):
         # ── Path 1: TBW-formula (fast) ────────────────────────────────────────
         if not self._grad_from_shape or shape_integral < 1e-12:
             G   = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
-            return G, self.tbw
+            return G, float(self.tbw)
 
         # ── Path 2: bisect from actual shape ──────────────────────────────────
         flip_rad = np.deg2rad(self.flip_deg)
@@ -1138,7 +1138,7 @@ class RFSimulator(QMainWindow):
         if abs(shape_sum_signed) > 1e-12:
             b1_T = flip_rad / (GAMMA_RAD * dt_s * shape_sum_signed)
         else:
-            b1_T = flip_rad / (GAMMA_RAD * dt_s * max(np.abs(shape_w).sum(), 1e-12))
+            b1_T = flip_rad / (GAMMA_RAD * dt_s * max(shape_integral, 1e-12))
         rf_rad   = (shape_w * b1_T * GAMMA_RAD * dt_s).astype(np.float64)
         rf_phs   = np.zeros(self.N, dtype=np.float64)
 
@@ -1147,19 +1147,22 @@ class RFSimulator(QMainWindow):
         Mxy_test, _ = bloch_simulate(rf_rad, rf_phs, test_off, dt_s)
         if np.clip(np.abs(Mxy_test[0]), 0, 1) < 0.01:
             G = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
-            return G, self.tbw
+            return G, float(self.tbw)
 
         def fwhm_for_G(G_tm):
-            # FOV = 6× expected slice at this G — adapts so slice is always captured
-            # Expected slice ≈ BW_pulse / (γ·G) where BW_pulse ≈ 1/T_RF
-            expected_slice_m = 1.0 / (GAMMA_HZ_PER_T * G_tm * T_RF)
-            fov_m = np.clip(expected_slice_m * 8, dz * 0.1, dz * 30)
-            S     = 256   # more points for better resolution
-            x_m   = np.linspace(-fov_m / 2, fov_m / 2, S)
-            offsets = GAMMA_HZ_PER_T * G_tm * x_m
-            Mxy, _  = bloch_simulate(rf_rad, rf_phs, offsets, dt_s)
-            mxy     = np.clip(np.abs(Mxy), 0, 1)
-            pk      = mxy.max()
+            # Fixed FOV = 6× target slice thickness — same spatial context for all G values.
+            # Use enough points so even narrow slices (high G) are resolved:
+            #   min_spacing = slice_mm/20 → n_points = fov / spacing = 6*slice*20/slice = 120
+            # But for high G the slice is narrow — use adaptive n_points:
+            fov_m    = dz * 6
+            # expected slice width at this G (just for choosing n_points, not for FOV)
+            exp_w_m  = max(1.0 / (GAMMA_HZ_PER_T * G_tm * T_RF), dz * 0.001)
+            n_pts    = int(np.clip(fov_m / exp_w_m * 20, 128, 2048))
+            x_m      = np.linspace(-fov_m / 2, fov_m / 2, n_pts)
+            offsets  = GAMMA_HZ_PER_T * G_tm * x_m
+            Mxy, _   = bloch_simulate(rf_rad, rf_phs, offsets, dt_s)
+            mxy      = np.clip(np.abs(Mxy), 0, 1)
+            pk       = mxy.max()
             if pk < 0.005:
                 return fov_m * 1e3
             idx = np.where(mxy >= pk * 0.5)[0]
@@ -1176,7 +1179,7 @@ class RFSimulator(QMainWindow):
             return G_lo, tbw_eff
         if fwhm_hi > self.slice_mm:
             G_nom = self.tbw / (GAMMA_HZ_PER_T * T_RF * dz)
-            return G_nom, self.tbw
+            return G_nom, float(self.tbw)
 
         for _ in range(24):
             G_mid    = (G_lo + G_hi) / 2.0
