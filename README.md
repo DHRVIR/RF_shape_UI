@@ -1,6 +1,6 @@
 # RF Pulse Bloch Simulator
 
-> 🚧 **Under Construction** actively developed, expect changes and new features.
+> 🚧 **Under Construction** — actively developed, expect changes and new features.
 
 An interactive desktop application for designing and simulating MRI RF pulse shapes with real-time Bloch equation simulation of slice profiles.
 
@@ -15,7 +15,7 @@ An interactive desktop application for designing and simulating MRI RF pulse sha
 - **Hand-draw RF pulses** directly on the canvas with a smooth Gaussian brush
 - **Real-time Bloch simulation** (hard-pulse approximation, no T1/T2) powered by Numba JIT + parallel CPU cores
 - **Live slice profiles**: |Mxy|, Mz, and Phase(Mxy) update as you draw
-- **Physically computed parameters**: B1 peak (µT) and slice-select gradient (mT/m) are derived from the pulse shape never entered manually
+- **Physically computed parameters**: B1 peak (µT) and slice-select gradient (mT/m) are derived from the pulse shape — never entered manually
 - **Window crop tool**: drag either edge of the active window to truncate the pulse; the canvas rescales automatically and TBW/gradient recompute from the new shape
 - **Shift pulse mode**: slide the entire waveform along the time axis without changing its shape
 - **B0 field selector** (1.5 T / 3.0 T / 7.0 T) with fat-water chemical shift marker
@@ -55,7 +55,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python rf_bloch_simulator.py
+python main.py
 ```
 
 ### Controls
@@ -91,17 +91,31 @@ The simulation uses the **hard-pulse Bloch equation** (rotation matrix formulati
 ## Project Structure
 
 ```
-rf_bloch_simulator.py    # Main application (single file)
-requirements.txt         # Python dependencies
-README.md                # This file
-.gitignore               # Git ignore rules
+main.py                          # Entry point — run this
+requirements.txt
+README.md
+LICENSE
+.gitignore
+rf_simulator/
+├── constants.py                 # Physical constants (γ, ppm)
+├── physics/
+│   ├── bloch.py                 # Bloch solver (Numba JIT + NumPy fallback)
+│   ├── presets.py               # 8 built-in pulse shapes + PRESETS registry
+│   └── gradient.py              # Slice-select gradient (analytic + bisection)
+└── ui/
+    ├── app.py                   # RFSimulator(QMainWindow) — assembles everything
+    ├── canvas.py                # Coordinate helpers, drawing, window overlay
+    ├── interactions.py          # Mouse and scroll event handlers
+    └── simulation.py            # _run_sim, profile plots, status bar
 ```
+
+The physics layer (`rf_simulator/physics/`) has no Qt dependency and can be imported and tested independently.
 
 ---
 
 ## License
 
-MIT License : see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
